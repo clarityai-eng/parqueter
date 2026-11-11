@@ -8,7 +8,7 @@ use std::rc::Rc;
 use gpui::*;
 use gpui_platform::application;
 
-use crate::data::InMemorySource;
+use crate::data::LazyParquetSource;
 use crate::ui::{AppState, RootView};
 
 fn main() {
@@ -19,7 +19,7 @@ fn main() {
             if !path.exists() {
                 AppState::Error(format!("File not found: {path_str}"))
             } else {
-                match InMemorySource::load(path) {
+                match LazyParquetSource::open(path) {
                     Ok(source) => {
                         let file_name = path
                             .file_name()

@@ -231,8 +231,7 @@ impl Render for RootView {
                                                     .text_ellipsis()
                                                     .child(
                                                         source_ref
-                                                            .cell(row_idx, col_idx)
-                                                            .to_string(),
+                                                            .cell(row_idx, col_idx),
                                                     ),
                                             ),
                                     );
