@@ -16,12 +16,18 @@ use crate::schema::ColumnInfo;
 
 const CACHE_CAPACITY: usize = 10;
 
+const MIN_COL_WIDTH: f32 = 80.0;
+const MAX_COL_WIDTH: f32 = 800.0;
+const CHAR_WIDTH: f32 = 9.0;
+const COL_PADDING: f32 = 28.0;
+
 pub trait DataSource {
     fn row_count(&self) -> usize;
     fn col_count(&self) -> usize;
     fn column_name(&self, col: usize) -> &str;
     fn column_type(&self, col: usize) -> &str;
     fn cell(&self, row: usize, col: usize) -> String;
+    fn column_widths(&self) -> Vec<f32>;
 }
 
 // -- InMemorySource (kept for testing) --
@@ -68,6 +74,9 @@ impl DataSource for InMemorySource {
     }
     fn cell(&self, row: usize, col: usize) -> String {
         self.rows[row][col].clone()
+    }
+    fn column_widths(&self) -> Vec<f32> {
+        compute_column_widths(self)
     }
 }
 
@@ -210,6 +219,10 @@ impl DataSource for LazyParquetSource {
             .map(|rows| rows[local_row][col].clone())
             .unwrap_or_default()
     }
+
+    fn column_widths(&self) -> Vec<f32> {
+        compute_column_widths(self)
+    }
 }
 
 // -- Shared helpers --
@@ -257,4 +270,26 @@ fn append_batch_rows(batch: &RecordBatch, rows: &mut Vec<Vec<String>>) {
         }
         rows.push(row);
     }
+}
+
+/// Compute per-column pixel widths by sampling column names and the first batch of rows.
+fn compute_column_widths(source: &dyn DataSource) -> Vec<f32> {
+    let col_count = source.col_count();
+    let sample_rows = source.row_count().min(1000);
+
+    (0..col_count)
+        .map(|col| {
+            // Start with column name length
+            let mut max_len = source.column_name(col).len();
+
+            // Sample first N rows for widest value
+            for row in 0..sample_rows {
+                let val = source.cell(row, col);
+                max_len = max_len.max(val.len());
+            }
+
+            let width = max_len as f32 * CHAR_WIDTH + COL_PADDING;
+            width.clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
+        })
+        .collect()
 }
