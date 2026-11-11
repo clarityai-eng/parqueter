@@ -1,5 +1,4 @@
 mod data;
-mod schema;
 mod ui;
 
 use std::path::Path;

@@ -1,18 +1,18 @@
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_cast::display::ArrayFormatter;
 use arrow_cast::display::FormatOptions;
 use lru::LruCache;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use parquet::file::metadata::ParquetMetaData;
 use std::fs::File;
 
-use crate::schema::ColumnInfo;
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+}
 
 const CACHE_CAPACITY: usize = 10;
 
@@ -30,56 +30,6 @@ pub trait DataSource {
     fn column_widths(&self) -> Vec<f32>;
 }
 
-// -- InMemorySource (kept for testing) --
-
-pub struct InMemorySource {
-    columns: Vec<ColumnInfo>,
-    rows: Vec<Vec<String>>,
-}
-
-impl InMemorySource {
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let file = open_file(path)?;
-
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| format!("Not a valid Parquet file: {e}"))?;
-
-        let columns = extract_columns(builder.schema());
-        let reader = builder
-            .build()
-            .map_err(|e| format!("Failed to build reader: {e}"))?;
-
-        let mut rows = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| format!("Error reading batch: {e}"))?;
-            append_batch_rows(&batch, &mut rows);
-        }
-
-        Ok(Self { columns, rows })
-    }
-}
-
-impl DataSource for InMemorySource {
-    fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-    fn col_count(&self) -> usize {
-        self.columns.len()
-    }
-    fn column_name(&self, col: usize) -> &str {
-        &self.columns[col].name
-    }
-    fn column_type(&self, col: usize) -> &str {
-        &self.columns[col].data_type
-    }
-    fn cell(&self, row: usize, col: usize) -> String {
-        self.rows[row][col].clone()
-    }
-    fn column_widths(&self) -> Vec<f32> {
-        compute_column_widths(self)
-    }
-}
-
 // -- LazyParquetSource --
 
 struct RowGroupInfo {
@@ -89,7 +39,6 @@ struct RowGroupInfo {
 
 pub struct LazyParquetSource {
     path: PathBuf,
-    metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
     columns: Vec<ColumnInfo>,
     row_groups: Vec<RowGroupInfo>,
@@ -107,14 +56,14 @@ impl LazyParquetSource {
         )
         .map_err(|e| format!("Not a valid Parquet file: {e}"))?;
 
-        let metadata = arrow_metadata.metadata().clone();
+        let parquet_metadata = arrow_metadata.metadata();
         let columns = extract_columns(arrow_metadata.schema());
 
         // Build row group index
-        let mut row_groups = Vec::with_capacity(metadata.num_row_groups());
+        let mut row_groups = Vec::with_capacity(parquet_metadata.num_row_groups());
         let mut start_row = 0usize;
-        for i in 0..metadata.num_row_groups() {
-            let num_rows = metadata.row_group(i).num_rows() as usize;
+        for i in 0..parquet_metadata.num_row_groups() {
+            let num_rows = parquet_metadata.row_group(i).num_rows() as usize;
             row_groups.push(RowGroupInfo { start_row, num_rows });
             start_row += num_rows;
         }
@@ -126,7 +75,6 @@ impl LazyParquetSource {
 
         Ok(Self {
             path: path.to_path_buf(),
-            metadata,
             arrow_metadata,
             columns,
             row_groups,
