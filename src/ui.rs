@@ -1,4 +1,4 @@
-use gpui::*;
+use gpui::{prelude::*, *};
 
 use crate::schema::ColumnInfo;
 
@@ -36,71 +36,66 @@ impl Render for RootView {
                         .child(msg.clone()),
                 ),
             AppState::Loaded { file_name, columns } => {
-                let mut col = div().flex().flex_col().size_full().p_4().gap_2();
+                // Header with file name (fixed, not scrollable)
+                let header = div()
+                    .pb_2()
+                    .mb_2()
+                    .px_4()
+                    .pt_4()
+                    .border_b_1()
+                    .border_color(rgb(0x45475a))
+                    .child(
+                        div()
+                            .text_xl()
+                            .text_color(rgb(0x89b4fa))
+                            .child(file_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x6c7086))
+                            .child(format!("{} columns", columns.len())),
+                    );
 
-                // Header with file name
-                col = col.child(
-                    div()
-                        .pb_2()
-                        .mb_2()
-                        .border_b_1()
-                        .border_color(rgb(0x45475a))
-                        .child(
-                            div()
-                                .text_xl()
-                                .text_color(rgb(0x89b4fa))
-                                .child(file_name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0x6c7086))
-                                .child(format!("{} columns", columns.len())),
-                        ),
-                );
+                // Column cards in a wrapping grid with scroll
+                let mut grid = div()
+                    .id("column-grid")
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .p_4()
+                    .flex_1();
 
-                // Column header row
-                col = col.child(
-                    div()
-                        .flex()
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .text_color(rgb(0x6c7086))
-                        .child(div().flex_1().child("Name"))
-                        .child(div().w(px(200.)).child("Type")),
-                );
-
-                // Column rows
                 for (i, column) in columns.iter().enumerate() {
                     let bg = if i % 2 == 0 {
-                        rgb(0x1e1e2e)
+                        rgb(0x313244)
                     } else {
-                        rgb(0x181825)
+                        rgb(0x2a2b3d)
                     };
-                    col = col.child(
+                    grid = grid.child(
                         div()
-                            .flex()
+                            .w(px(200.))
                             .px_3()
-                            .py_1()
-                            .rounded_sm()
+                            .py_2()
+                            .rounded_md()
                             .bg(bg)
                             .child(
                                 div()
-                                    .flex_1()
                                     .text_color(rgb(0xcdd6f4))
+                                    .text_sm()
                                     .child(column.name.clone()),
                             )
                             .child(
                                 div()
-                                    .w(px(200.))
-                                    .text_color(rgb(0xa6adc8))
+                                    .text_color(rgb(0x6c7086))
+                                    .text_xs()
                                     .child(column.data_type.clone()),
                             ),
                     );
                 }
 
-                col
+                div().flex().flex_col().size_full().child(header).child(grid)
             }
         };
 
