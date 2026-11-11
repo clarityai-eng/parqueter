@@ -1,0 +1,9 @@
+[package]
+name = "parqueter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parquet = { version = "60.1.0", features = ["arrow"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "985bbf42e684" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "985bbf42e684", features = ["font-kit", "wayland", "x11"] }
