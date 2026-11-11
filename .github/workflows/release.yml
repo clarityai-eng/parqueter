@@ -52,7 +52,10 @@ jobs:
             libx11-xcb-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
-            libxcb-xfixes0-dev
+            libxcb-xfixes0-dev \
+            libfontconfig-dev \
+            libfreetype-dev \
+            pkg-config
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
