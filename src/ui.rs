@@ -8,6 +8,8 @@ const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
 const HEADER_HEIGHT: f32 = 58.0;
 const SCROLL_STEP: f32 = 100.0;
+const SCROLLBAR_SIZE: f32 = 8.0;
+const SCROLLBAR_MIN_THUMB: f32 = 20.0;
 
 actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight]);
 
@@ -114,6 +116,68 @@ impl RootView {
     fn scroll_right(&mut self, _: &ScrollRight, window: &mut Window, _cx: &mut Context<Self>) {
         self.h_offset = (self.h_offset + SCROLL_STEP).min(self.data_width);
         window.refresh();
+    }
+
+    /// Render a vertical scrollbar. Returns (track, needs_scrollbar).
+    fn vertical_scrollbar(&self, track_height: f32) -> Option<Div> {
+        let state = self.v_scroll_handle.0.borrow();
+        let max_off_f: f32 = state.base_handle.max_offset().y.into();
+        if max_off_f <= 0.0 {
+            return None;
+        }
+        let cur_off: f32 = (-state.base_handle.offset().y).into();
+        let ratio = (cur_off / max_off_f).clamp(0.0, 1.0);
+
+        // thumb size proportional to viewport/content
+        let content_h = track_height + max_off_f;
+        let thumb_h = (track_height / content_h * track_height).max(SCROLLBAR_MIN_THUMB);
+        let thumb_top = ratio * (track_height - thumb_h);
+
+        Some(
+            div()
+                .absolute()
+                .right_0()
+                .top(px(HEADER_HEIGHT))
+                .w(px(SCROLLBAR_SIZE))
+                .h(px(track_height))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .w(px(SCROLLBAR_SIZE))
+                        .h(px(thumb_h))
+                        .rounded(px(SCROLLBAR_SIZE / 2.0))
+                        .bg(rgb(0x585b70)),
+                ),
+        )
+    }
+
+    /// Render a horizontal scrollbar.
+    fn horizontal_scrollbar(&self, track_width: f32) -> Option<Div> {
+        if self.data_width <= track_width {
+            return None;
+        }
+        let ratio = self.h_offset / self.data_width;
+        let thumb_w = (track_width / self.data_width * track_width).max(SCROLLBAR_MIN_THUMB);
+        let thumb_left = ratio * (track_width - thumb_w);
+
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left(px(ROW_NUM_WIDTH))
+                .w(px(track_width))
+                .h(px(SCROLLBAR_SIZE))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(thumb_left))
+                        .w(px(thumb_w))
+                        .h(px(SCROLLBAR_SIZE))
+                        .rounded(px(SCROLLBAR_SIZE / 2.0))
+                        .bg(rgb(0x585b70)),
+                ),
+        )
     }
 }
 
@@ -308,6 +372,9 @@ impl Render for RootView {
                 .flex_1()
                 .track_scroll(&self.v_scroll_handle);
 
+                let viewport_h: f32 = (window.viewport_size().height - px(HEADER_HEIGHT)).into();
+                let body_h = viewport_h - HEADER_HEIGHT; // approximate data area height
+
                 let body = div()
                     .flex()
                     .flex_col()
@@ -316,12 +383,28 @@ impl Render for RootView {
                     .child(header_row)
                     .child(data_rows);
 
+                // Main layout with scrollbar overlays
+                let mut table_area = div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body);
+
+                if let Some(v_bar) = self.vertical_scrollbar(body_h) {
+                    table_area = table_area.child(v_bar);
+                }
+                if let Some(h_bar) = self.horizontal_scrollbar(viewport_w) {
+                    table_area = table_area.child(h_bar);
+                }
+
                 div()
                     .flex()
                     .flex_col()
                     .size_full()
                     .child(file_header)
-                    .child(body)
+                    .child(table_area)
                     .into_any_element()
             }
         };
