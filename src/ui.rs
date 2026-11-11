@@ -6,6 +6,7 @@ use crate::data::DataSource;
 
 const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
+const HEADER_HEIGHT: f32 = 58.0;
 const SCROLL_STEP: f32 = 100.0;
 
 actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight]);
@@ -30,6 +31,8 @@ pub enum AppState {
 pub struct RootView {
     state: AppState,
     col_widths: Vec<f32>,
+    col_positions: Vec<f32>,
+    data_width: f32,
     focus_handle: FocusHandle,
     v_scroll_handle: UniformListScrollHandle,
     scroll_row: usize,
@@ -42,9 +45,18 @@ impl RootView {
             AppState::Loaded { source, .. } => source.column_widths(),
             _ => vec![],
         };
+        let mut col_positions = Vec::with_capacity(col_widths.len());
+        let mut acc = 0.0f32;
+        for &w in &col_widths {
+            col_positions.push(acc);
+            acc += w;
+        }
+        let data_width = acc;
         Self {
             state,
             col_widths,
+            col_positions,
+            data_width,
             focus_handle: cx.focus_handle(),
             v_scroll_handle: UniformListScrollHandle::new(),
             scroll_row: 0,
@@ -52,8 +64,24 @@ impl RootView {
         }
     }
 
-    fn data_width(&self) -> f32 {
-        self.col_widths.iter().sum()
+    fn visible_col_range(&self, viewport_width: f32) -> (usize, usize, f32) {
+        if self.col_positions.is_empty() {
+            return (0, 0, 0.0);
+        }
+        let left = self.h_offset;
+        let right = self.h_offset + viewport_width;
+
+        let first = (0..self.col_widths.len())
+            .find(|&i| self.col_positions[i] + self.col_widths[i] > left)
+            .unwrap_or(0);
+
+        let last = self
+            .col_positions
+            .partition_point(|&pos| pos < right)
+            .min(self.col_widths.len());
+
+        let spacer = self.col_positions[first] - left;
+        (first, last, spacer)
     }
 
     fn row_count(&self) -> usize {
@@ -84,8 +112,7 @@ impl RootView {
     }
 
     fn scroll_right(&mut self, _: &ScrollRight, window: &mut Window, _cx: &mut Context<Self>) {
-        let max_offset = self.data_width();
-        self.h_offset = (self.h_offset + SCROLL_STEP).min(max_offset);
+        self.h_offset = (self.h_offset + SCROLL_STEP).min(self.data_width);
         window.refresh();
     }
 }
@@ -97,7 +124,7 @@ impl Focusable for RootView {
 }
 
 impl Render for RootView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.state {
             AppState::Error(msg) => div()
                 .flex()
@@ -116,11 +143,11 @@ impl Render for RootView {
             AppState::Loaded { file_name, source } => {
                 let col_count = source.col_count();
                 let row_count = source.row_count();
-                let col_widths = &self.col_widths;
-                let data_width: f32 = col_widths.iter().sum();
-                let h_offset = self.h_offset;
+                let viewport_w: f32 = (window.viewport_size().width - px(ROW_NUM_WIDTH)).into();
+                let (vis_first, vis_last, spacer) = self.visible_col_range(viewport_w);
+                let vis_widths: Vec<f32> = self.col_widths[vis_first..vis_last].to_vec();
 
-                // File info header (fixed, outside scroll)
+                // File info header
                 let file_header = div()
                     .pb_2()
                     .px_4()
@@ -140,35 +167,21 @@ impl Render for RootView {
                             .child(format!("{col_count} columns · {row_count} rows")),
                     );
 
-                // -- Fixed row-number column header (#) --
-                let row_num_header = div()
-                    .w(px(ROW_NUM_WIDTH))
-                    .h(px(48.0))
-                    .px_2()
-                    .py_1()
-                    .border_r_1()
-                    .border_b_1()
-                    .border_color(rgb(0x45475a))
-                    .bg(rgb(0x313244))
-                    .child(
+                // -- Column header row --
+                // Fixed row-num cell + clipped data area (viewport_w wide)
+                let header_bg = rgb(0x313244);
+                let mut header_data = div().flex().ml(px(spacer));
+                for (i, col) in (vis_first..vis_last).enumerate() {
+                    header_data = header_data.child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(0x6c7086))
-                            .child("#"),
-                    );
-
-                // -- Scrollable column headers (inside h-scroll) --
-                let mut col_headers = div().flex().h(px(48.0));
-                for col in 0..col_count {
-                    col_headers = col_headers.child(
-                        div()
-                            .w(px(col_widths[col]))
+                            .w(px(vis_widths[i]))
+                            .h(px(HEADER_HEIGHT))
                             .px_2()
                             .py_1()
                             .border_r_1()
                             .border_b_1()
                             .border_color(rgb(0x45475a))
-                            .bg(rgb(0x313244))
+                            .bg(header_bg)
                             .overflow_hidden()
                             .child(
                                 div()
@@ -182,31 +195,44 @@ impl Render for RootView {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(0x6c7086))
-                                    .child(source.column_type(col).to_string()),
+                                    .child(format!(
+                                        "{} · col {}",
+                                        source.column_type(col),
+                                        col + 1
+                                    )),
                             ),
                     );
                 }
 
-                // Combined header row: fixed # + scrollable column headers
                 let header_row = div()
                     .flex()
-                    .child(row_num_header)
+                    .h(px(HEADER_HEIGHT))
                     .child(
+                        // Fixed row-number cell
                         div()
-                            .flex_1()
+                            .w(px(ROW_NUM_WIDTH))
+                            .h(px(HEADER_HEIGHT))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .border_r_1()
+                            .border_b_1()
+                            .border_color(rgb(0x45475a))
+                            .bg(header_bg)
+                            .child(div().text_sm().text_color(rgb(0x6c7086)).child("#")),
+                    )
+                    .child(
+                        // Clipped viewport for header columns
+                        div()
+                            .w(px(viewport_w))
+                            .h(px(HEADER_HEIGHT))
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .w(px(data_width))
-                                    .ml(px(-h_offset))
-                                    .child(col_headers),
-                            ),
+                            .child(header_data),
                     );
 
-                // -- Data rows via uniform_list --
-                // Each row: fixed row-number cell + scrollable data cells
+                // -- Data rows --
                 let source_ref = Rc::clone(source);
-                let widths = col_widths.clone();
+                let widths = vis_widths;
                 let data_rows = uniform_list(
                     "data-rows",
                     row_count,
@@ -219,18 +245,18 @@ impl Render for RootView {
                                     rgb(0x181825)
                                 };
 
-                                // Data cells (will be inside h-scroll)
-                                let mut data_div = div().flex().h(px(ROW_HEIGHT));
-                                for col_idx in 0..col_count {
-                                    data_div = data_div.child(
+                                // Data cells
+                                let mut data_cells = div().flex().ml(px(spacer));
+                                for (i, col_idx) in (vis_first..vis_last).enumerate() {
+                                    data_cells = data_cells.child(
                                         div()
-                                            .w(px(widths[col_idx]))
+                                            .w(px(widths[i]))
                                             .h(px(ROW_HEIGHT))
                                             .px_2()
                                             .flex()
                                             .items_center()
                                             .border_r_1()
-                                            .border_color(rgb(0x313244))
+                                            .border_color(rgb(0x45475a))
                                             .overflow_hidden()
                                             .child(
                                                 div()
@@ -239,19 +265,18 @@ impl Render for RootView {
                                                     .whitespace_nowrap()
                                                     .text_ellipsis()
                                                     .child(
-                                                        source_ref
-                                                            .cell(row_idx, col_idx),
+                                                        source_ref.cell(row_idx, col_idx),
                                                     ),
                                             ),
                                     );
                                 }
 
-                                // Fixed row number + data cells
                                 div()
                                     .flex()
                                     .h(px(ROW_HEIGHT))
                                     .bg(bg)
                                     .child(
+                                        // Fixed row-number cell
                                         div()
                                             .w(px(ROW_NUM_WIDTH))
                                             .h(px(ROW_HEIGHT))
@@ -259,7 +284,7 @@ impl Render for RootView {
                                             .flex()
                                             .items_center()
                                             .border_r_1()
-                                            .border_color(rgb(0x313244))
+                                            .border_color(rgb(0x45475a))
                                             .bg(bg)
                                             .child(
                                                 div()
@@ -269,12 +294,12 @@ impl Render for RootView {
                                             ),
                                     )
                                     .child(
-                                        div().flex_1().overflow_hidden().child(
-                                            div()
-                                                .w(px(data_width))
-                                                .ml(px(-h_offset))
-                                                .child(data_div),
-                                        ),
+                                        // Clipped viewport for data columns
+                                        div()
+                                            .w(px(viewport_w))
+                                            .h(px(ROW_HEIGHT))
+                                            .overflow_hidden()
+                                            .child(data_cells),
                                     )
                             })
                             .collect()
@@ -283,9 +308,6 @@ impl Render for RootView {
                 .flex_1()
                 .track_scroll(&self.v_scroll_handle);
 
-                // Body area: header row + data rows (both share the same h-scroll offset)
-                // We sync horizontal scroll by applying the offset as a negative margin
-                // on the scrollable portions via the h-scroll container
                 let body = div()
                     .flex()
                     .flex_col()
