@@ -28,6 +28,9 @@ pub trait DataSource {
     fn column_type(&self, col: usize) -> &str;
     fn cell(&self, row: usize, col: usize) -> String;
     fn column_widths(&self) -> Vec<f32>;
+    /// Check if the row's batch is cached without triggering a load.
+    #[allow(dead_code)]
+    fn is_cached(&self, row: usize) -> bool;
 }
 
 // -- LazyParquetSource --
@@ -170,6 +173,11 @@ impl DataSource for LazyParquetSource {
 
     fn column_widths(&self) -> Vec<f32> {
         compute_column_widths(self)
+    }
+
+    fn is_cached(&self, row: usize) -> bool {
+        let (rg_idx, _) = self.find_row_group(row);
+        self.cache.borrow().contains(&rg_idx)
     }
 }
 

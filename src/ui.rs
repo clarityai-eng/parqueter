@@ -182,21 +182,20 @@ impl RootView {
         if self.v_track_height <= 0.0 || self.v_max_offset <= 0.0 {
             return;
         }
-        // Jump: map click Y position to scroll offset
-        // event.position is in window coordinates; track starts at file_header_height + HEADER_HEIGHT
+        // Jump: map click Y to scroll offset via set_offset
         let file_header_h = to_f32(window.viewport_size().height) - self.v_track_height - HEADER_HEIGHT;
         let click_in_track = to_f32(event.position.y) - file_header_h - HEADER_HEIGHT;
         let ratio = (click_in_track / self.v_track_height).clamp(0.0, 1.0);
-        let target_row = (ratio * self.row_count() as f32) as usize;
-        self.scroll_row = target_row.min(self.row_count().saturating_sub(1));
-        self.v_scroll_handle
-            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
+        let new_offset = ratio * self.v_max_offset;
+        {
+            let state = self.v_scroll_handle.0.borrow();
+            state.base_handle.set_offset(point(state.base_handle.offset().x, px(-new_offset)));
+        }
 
         // Start drag
         self.dragging = Some(DragTarget::Vertical);
         self.drag_start_pos = to_f32(event.position.y);
-        let state = self.v_scroll_handle.0.borrow();
-        self.drag_start_offset = to_f32(-state.base_handle.offset().y);
+        self.drag_start_offset = new_offset;
         window.refresh();
     }
 
@@ -234,24 +233,12 @@ impl RootView {
                     return;
                 }
                 let delta_px = to_f32(event.position.y) - self.drag_start_pos;
-                // Convert pixel delta to scroll offset delta
                 let scale = self.v_max_offset / self.v_track_height;
                 let new_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.v_max_offset);
-                // Convert offset to row index
-                let row_count = self.row_count();
-                if row_count > 0 {
-                    let ratio = new_offset / self.v_max_offset;
-                    self.scroll_row = ((ratio * row_count as f32) as usize).min(row_count - 1);
-                    self.v_scroll_handle
-                        .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
-                }
-                // Also set the raw pixel offset for smooth tracking
+                // Direct pixel offset only — no scroll_to_item, no data loading
                 {
                     let state = self.v_scroll_handle.0.borrow();
-                    let current_x = state.base_handle.offset().x;
-                    state
-                        .base_handle
-                        .set_offset(point(current_x, px(-new_offset)));
+                    state.base_handle.set_offset(point(state.base_handle.offset().x, px(-new_offset)));
                 }
                 window.refresh();
             }
@@ -270,10 +257,14 @@ impl RootView {
     fn on_global_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        self.dragging = None;
+        if self.dragging.is_some() {
+            self.dragging = None;
+            // Trigger a render that loads actual data
+            window.refresh();
+        }
     }
 }
 
@@ -390,6 +381,7 @@ impl Render for RootView {
                 // -- Data rows --
                 let source_ref = Rc::clone(source);
                 let widths = vis_widths;
+                let v_dragging = self.dragging == Some(DragTarget::Vertical);
                 let data_rows = uniform_list(
                     "data-rows",
                     row_count,
@@ -403,28 +395,41 @@ impl Render for RootView {
                                 };
 
                                 let mut data_cells = div().flex().ml(px(spacer));
-                                for (i, col_idx) in (vis_first..vis_last).enumerate() {
-                                    data_cells = data_cells.child(
-                                        div()
-                                            .w(px(widths[i]))
-                                            .h(px(ROW_HEIGHT))
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .border_r_1()
-                                            .border_color(rgb(0x45475a))
-                                            .overflow_hidden()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0xcdd6f4))
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .child(
-                                                        source_ref.cell(row_idx, col_idx),
-                                                    ),
-                                            ),
-                                    );
+                                if !v_dragging {
+                                    for (i, col_idx) in (vis_first..vis_last).enumerate() {
+                                        data_cells = data_cells.child(
+                                            div()
+                                                .w(px(widths[i]))
+                                                .h(px(ROW_HEIGHT))
+                                                .px_2()
+                                                .flex()
+                                                .items_center()
+                                                .border_r_1()
+                                                .border_color(rgb(0x45475a))
+                                                .overflow_hidden()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(rgb(0xcdd6f4))
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .child(
+                                                            source_ref.cell(row_idx, col_idx),
+                                                        ),
+                                                ),
+                                        );
+                                    }
+                                } else {
+                                    // During vertical drag: empty cells, no I/O
+                                    for (i, _) in (vis_first..vis_last).enumerate() {
+                                        data_cells = data_cells.child(
+                                            div()
+                                                .w(px(widths[i]))
+                                                .h(px(ROW_HEIGHT))
+                                                .border_r_1()
+                                                .border_color(rgb(0x45475a)),
+                                        );
+                                    }
                                 }
 
                                 div()
