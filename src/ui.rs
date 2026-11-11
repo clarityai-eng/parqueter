@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{prelude::*, *};
 
@@ -7,6 +8,7 @@ use crate::data::DataSource;
 const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
 const HEADER_HEIGHT: f32 = 58.0;
+const FILE_HEADER_HEIGHT: f32 = 70.0; // approximate: pt_4 + text_xl + text_sm + pb_2 + border
 const SCROLL_STEP: f32 = 100.0;
 const SCROLLBAR_SIZE: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;
@@ -54,6 +56,8 @@ pub struct RootView {
     dragging: Option<DragTarget>,
     drag_start_pos: f32,       // mouse position when drag started
     drag_start_offset: f32,    // scroll offset when drag started
+    drag_idle: bool,           // true when drag paused long enough to show data
+    drag_generation: usize,    // bumped on each mouse move, idle timer checks this
     // Cached layout dimensions (updated each render)
     v_track_height: f32,
     h_track_width: f32,
@@ -86,6 +90,8 @@ impl RootView {
             dragging: None,
             drag_start_pos: 0.0,
             drag_start_offset: 0.0,
+            drag_idle: false,
+            drag_generation: 0,
             v_track_height: 0.0,
             h_track_width: 0.0,
             v_max_offset: 0.0,
@@ -148,11 +154,19 @@ impl RootView {
     // -- Scrollbar metrics --
 
     fn v_scroll_metrics(&self, track_height: f32) -> Option<(f32, f32, f32)> {
-        let state = self.v_scroll_handle.0.borrow();
-        let max_off: f32 = state.base_handle.max_offset().y.into();
+        // Use cached v_max_offset (from last full render) as the authoritative max,
+        // because during deferred drag the live max_offset may be stale/zero.
+        let max_off = if self.v_max_offset > 0.0 {
+            self.v_max_offset
+        } else {
+            let state = self.v_scroll_handle.0.borrow();
+            let live: f32 = state.base_handle.max_offset().y.into();
+            live
+        };
         if max_off <= 0.0 {
             return None;
         }
+        let state = self.v_scroll_handle.0.borrow();
         let cur_off: f32 = (-state.base_handle.offset().y).into();
         let ratio = (cur_off / max_off).clamp(0.0, 1.0);
         let content_h = track_height + max_off;
@@ -224,7 +238,7 @@ impl RootView {
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let Some(target) = self.dragging else { return };
         match target {
@@ -235,11 +249,29 @@ impl RootView {
                 let delta_px = to_f32(event.position.y) - self.drag_start_pos;
                 let scale = self.v_max_offset / self.v_track_height;
                 let new_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.v_max_offset);
-                // Direct pixel offset only — no scroll_to_item, no data loading
                 {
                     let state = self.v_scroll_handle.0.borrow();
                     state.base_handle.set_offset(point(state.base_handle.offset().x, px(-new_offset)));
                 }
+                // Movement detected: reset idle, bump generation, schedule idle check
+                self.drag_idle = false;
+                self.drag_generation = self.drag_generation.wrapping_add(1);
+                let generation = self.drag_generation;
+                cx.spawn_in(window, async move |_this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    cx.update(|window, cx| {
+                        if let Some(entity) = _this.upgrade() {
+                            entity.update(cx, |view, _cx| {
+                                if view.dragging == Some(DragTarget::Vertical)
+                                    && view.drag_generation == generation
+                                {
+                                    view.drag_idle = true;
+                                }
+                            });
+                            window.refresh();
+                        }
+                    }).ok();
+                }).detach();
                 window.refresh();
             }
             DragTarget::Horizontal => {
@@ -249,6 +281,25 @@ impl RootView {
                 let delta_px = to_f32(event.position.x) - self.drag_start_pos;
                 let scale = self.h_max_offset / self.h_track_width;
                 self.h_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.h_max_offset);
+                // Same idle pattern as vertical
+                self.drag_idle = false;
+                self.drag_generation = self.drag_generation.wrapping_add(1);
+                let generation = self.drag_generation;
+                cx.spawn_in(window, async move |_this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    cx.update(|window, cx| {
+                        if let Some(entity) = _this.upgrade() {
+                            entity.update(cx, |view, _cx| {
+                                if view.dragging == Some(DragTarget::Horizontal)
+                                    && view.drag_generation == generation
+                                {
+                                    view.drag_idle = true;
+                                }
+                            });
+                            window.refresh();
+                        }
+                    }).ok();
+                }).detach();
                 window.refresh();
             }
         }
@@ -262,7 +313,7 @@ impl RootView {
     ) {
         if self.dragging.is_some() {
             self.dragging = None;
-            // Trigger a render that loads actual data
+            self.drag_idle = false;
             window.refresh();
         }
     }
@@ -381,7 +432,7 @@ impl Render for RootView {
                 // -- Data rows --
                 let source_ref = Rc::clone(source);
                 let widths = vis_widths;
-                let v_dragging = self.dragging == Some(DragTarget::Vertical);
+                let dragging_fast = self.dragging.is_some() && !self.drag_idle;
                 let data_rows = uniform_list(
                     "data-rows",
                     row_count,
@@ -395,41 +446,32 @@ impl Render for RootView {
                                 };
 
                                 let mut data_cells = div().flex().ml(px(spacer));
-                                if !v_dragging {
-                                    for (i, col_idx) in (vis_first..vis_last).enumerate() {
-                                        data_cells = data_cells.child(
-                                            div()
-                                                .w(px(widths[i]))
-                                                .h(px(ROW_HEIGHT))
-                                                .px_2()
-                                                .flex()
-                                                .items_center()
-                                                .border_r_1()
-                                                .border_color(rgb(0x45475a))
-                                                .overflow_hidden()
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(rgb(0xcdd6f4))
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .child(
-                                                            source_ref.cell(row_idx, col_idx),
-                                                        ),
-                                                ),
-                                        );
+                                // During drag: show data if cached (free), empty if not (skip I/O)
+                                let show_data = !dragging_fast || source_ref.is_cached(row_idx);
+                                for (i, col_idx) in (vis_first..vis_last).enumerate() {
+                                    let mut cell = div()
+                                        .w(px(widths[i]))
+                                        .h(px(ROW_HEIGHT))
+                                        .border_r_1()
+                                        .border_color(rgb(0x45475a));
+                                    if show_data {
+                                        cell = cell
+                                            .px_2()
+                                            .flex()
+                                            .items_center()
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xcdd6f4))
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(
+                                                        source_ref.cell(row_idx, col_idx),
+                                                    ),
+                                            );
                                     }
-                                } else {
-                                    // During vertical drag: empty cells, no I/O
-                                    for (i, _) in (vis_first..vis_last).enumerate() {
-                                        data_cells = data_cells.child(
-                                            div()
-                                                .w(px(widths[i]))
-                                                .h(px(ROW_HEIGHT))
-                                                .border_r_1()
-                                                .border_color(rgb(0x45475a)),
-                                        );
-                                    }
+                                    data_cells = data_cells.child(cell);
                                 }
 
                                 div()
@@ -468,8 +510,9 @@ impl Render for RootView {
                 .track_scroll(&self.v_scroll_handle);
 
                 // -- Compute layout dimensions for scrollbars --
-                let viewport_h: f32 = (window.viewport_size().height - px(HEADER_HEIGHT)).into();
-                let body_h = viewport_h - HEADER_HEIGHT;
+                // Scrollbar track = window height - file header - column header row
+                let window_h: f32 = window.viewport_size().height.into();
+                let body_h = (window_h - FILE_HEADER_HEIGHT - HEADER_HEIGHT).max(0.0);
                 self.v_track_height = body_h;
                 self.h_track_width = viewport_w;
                 self.h_max_offset = (self.data_width - viewport_w).max(0.0);
@@ -477,7 +520,10 @@ impl Render for RootView {
                 // Cache v_max_offset for drag handler
                 {
                     let state = self.v_scroll_handle.0.borrow();
-                    self.v_max_offset = state.base_handle.max_offset().y.into();
+                    let live_max: f32 = state.base_handle.max_offset().y.into();
+                    if live_max > 0.0 {
+                        self.v_max_offset = live_max;
+                    }
                 }
 
                 // -- Scrollbars --

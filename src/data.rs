@@ -29,7 +29,6 @@ pub trait DataSource {
     fn cell(&self, row: usize, col: usize) -> String;
     fn column_widths(&self) -> Vec<f32>;
     /// Check if the row's batch is cached without triggering a load.
-    #[allow(dead_code)]
     fn is_cached(&self, row: usize) -> bool;
 }
 
