@@ -9,7 +9,7 @@ const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
 const HEADER_HEIGHT: f32 = 58.0;
 const FILE_HEADER_HEIGHT: f32 = 70.0; // approximate: pt_4 + text_xl + text_sm + pb_2 + border
-const SCROLL_STEP: f32 = 100.0;
+const SCROLL_STEP: f32 = 300.0;
 const SCROLLBAR_SIZE: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;
 
@@ -18,7 +18,10 @@ fn to_f32(p: Pixels) -> f32 {
     v
 }
 
-actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight]);
+const ROW_STEP: usize = 20;
+const PAGE_STEP: usize = 200;
+
+actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown]);
 
 pub fn register_actions(cx: &mut App) {
     cx.bind_keys([
@@ -26,6 +29,8 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("down", ScrollDown, None),
         KeyBinding::new("left", ScrollLeft, None),
         KeyBinding::new("right", ScrollRight, None),
+        KeyBinding::new("pageup", PageUp, None),
+        KeyBinding::new("pagedown", PageDown, None),
     ]);
 }
 
@@ -127,7 +132,7 @@ impl RootView {
     }
 
     fn scroll_up(&mut self, _: &ScrollUp, window: &mut Window, _cx: &mut Context<Self>) {
-        self.scroll_row = self.scroll_row.saturating_sub(5);
+        self.scroll_row = self.scroll_row.saturating_sub(ROW_STEP);
         self.v_scroll_handle
             .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
         window.refresh();
@@ -135,7 +140,22 @@ impl RootView {
 
     fn scroll_down(&mut self, _: &ScrollDown, window: &mut Window, _cx: &mut Context<Self>) {
         let max = self.row_count().saturating_sub(1);
-        self.scroll_row = (self.scroll_row + 5).min(max);
+        self.scroll_row = (self.scroll_row + ROW_STEP).min(max);
+        self.v_scroll_handle
+            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
+        window.refresh();
+    }
+
+    fn page_up(&mut self, _: &PageUp, window: &mut Window, _cx: &mut Context<Self>) {
+        self.scroll_row = self.scroll_row.saturating_sub(PAGE_STEP);
+        self.v_scroll_handle
+            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
+        window.refresh();
+    }
+
+    fn page_down(&mut self, _: &PageDown, window: &mut Window, _cx: &mut Context<Self>) {
+        let max = self.row_count().saturating_sub(1);
+        self.scroll_row = (self.scroll_row + PAGE_STEP).min(max);
         self.v_scroll_handle
             .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
         window.refresh();
@@ -394,13 +414,12 @@ impl Render for RootView {
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .justify_between()
                                     .text_xs()
                                     .text_color(rgb(0x6c7086))
-                                    .child(format!(
-                                        "{} · col {}",
-                                        source.column_type(col),
-                                        col + 1
-                                    )),
+                                    .child(format!("#{}", col + 1))
+                                    .child(format!("type: {}", source.column_type(col))),
                             ),
                     );
                 }
@@ -617,6 +636,8 @@ impl Render for RootView {
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::scroll_left))
             .on_action(cx.listener(Self::scroll_right))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
             .on_mouse_move(cx.listener(Self::on_global_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
             .size_full()
