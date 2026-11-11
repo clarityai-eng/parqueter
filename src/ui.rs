@@ -21,7 +21,7 @@ fn to_f32(p: Pixels) -> f32 {
 const ROW_STEP: usize = 20;
 const PAGE_STEP: usize = 200;
 
-actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown]);
+actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown, CopyCell]);
 
 pub fn register_actions(cx: &mut App) {
     cx.bind_keys([
@@ -31,6 +31,7 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("right", ScrollRight, None),
         KeyBinding::new("pageup", PageUp, None),
         KeyBinding::new("pagedown", PageDown, None),
+        KeyBinding::new("ctrl-c", CopyCell, None),
     ]);
 }
 
@@ -64,6 +65,9 @@ pub struct RootView {
     drag_start_offset: f32,    // scroll offset when drag started
     drag_idle: bool,           // true when drag paused long enough to show data
     drag_generation: usize,    // bumped on each mouse move, idle timer checks this
+    selected_cell: Option<(usize, usize)>, // (row, col)
+    toast: Option<String>,
+    toast_generation: usize,
     // Cached layout dimensions (updated each render)
     v_track_height: f32,
     h_track_width: f32,
@@ -104,6 +108,9 @@ impl RootView {
             drag_start_offset: 0.0,
             drag_idle: false,
             drag_generation: 0,
+            selected_cell: None,
+            toast: None,
+            toast_generation: 0,
             v_track_height: 0.0,
             h_track_width: 0.0,
             v_max_offset: 0.0,
@@ -165,6 +172,81 @@ impl RootView {
         self.scroll_row = (self.scroll_row + PAGE_STEP).min(max);
         self.v_scroll_handle
             .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
+        window.refresh();
+    }
+
+    const HEADER_ROW: usize = usize::MAX;
+    const TOAST_DURATION_MS: u64 = 1500;
+
+    fn show_toast(&mut self, msg: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.toast = Some(msg);
+        self.toast_generation = self.toast_generation.wrapping_add(1);
+        let generation = self.toast_generation;
+        cx.spawn_in(window, async move |_this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(RootView::TOAST_DURATION_MS))
+                .await;
+            cx.update(|window, cx| {
+                if let Some(entity) = _this.upgrade() {
+                    entity.update(cx, |view, _cx| {
+                        if view.toast_generation == generation {
+                            view.toast = None;
+                        }
+                    });
+                    window.refresh();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        window.refresh();
+    }
+
+    fn cell_text_for_selection(&self, row: usize, col: usize) -> Option<String> {
+        let AppState::Loaded { source, .. } = &self.state else {
+            return None;
+        };
+        if row == Self::HEADER_ROW {
+            Some(source.column_name(col).to_string())
+        } else {
+            Some(source.cell(row, col))
+        }
+    }
+
+    fn copy_cell(&mut self, _: &CopyCell, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((row, col)) = self.selected_cell {
+            if let Some(text) = self.cell_text_for_selection(row, col) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                let preview = if text.len() > 40 {
+                    format!("\"{}...\" copied", &text[..37])
+                } else {
+                    format!("\"{text}\" copied")
+                };
+                self.show_toast(preview, window, cx);
+            }
+        }
+    }
+
+    fn select_and_maybe_copy(
+        &mut self,
+        row: usize,
+        col: usize,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_cell = Some((row, col));
+        if click_count >= 2 {
+            if let Some(text) = self.cell_text_for_selection(row, col) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                let preview = if text.len() > 40 {
+                    format!("\"{}...\" copied", &text[..37])
+                } else {
+                    format!("\"{text}\" copied")
+                };
+                self.show_toast(preview, window, cx);
+            }
+        }
         window.refresh();
     }
 
@@ -399,10 +481,16 @@ impl Render for RootView {
 
                 // -- Column header row --
                 let header_bg = rgb(0x313244);
+                let header_selected_bg = rgb(0x585b70);
+                let header_view = cx.entity().downgrade();
                 let mut header_data = div().flex().ml(px(spacer));
                 for (i, col) in (vis_first..vis_last).enumerate() {
+                    let is_selected = self.selected_cell == Some((Self::HEADER_ROW, col));
+                    let bg = if is_selected { header_selected_bg } else { header_bg };
+                    let view = header_view.clone();
                     header_data = header_data.child(
                         div()
+                            .id(ElementId::NamedInteger("hdr".into(), col as u64))
                             .w(px(vis_widths[i]))
                             .h(px(HEADER_HEIGHT))
                             .px_2()
@@ -410,8 +498,17 @@ impl Render for RootView {
                             .border_r_1()
                             .border_b_1()
                             .border_color(rgb(0x45475a))
-                            .bg(header_bg)
+                            .bg(bg)
                             .overflow_hidden()
+                            .cursor_pointer()
+                            .on_click(move |event: &ClickEvent, window, cx| {
+                                if let Some(entity) = view.upgrade() {
+                                    let count = event.click_count();
+                                    entity.update(cx, |this, cx| {
+                                        this.select_and_maybe_copy(RootView::HEADER_ROW, col, count, window, cx);
+                                    });
+                                }
+                            })
                             .child(
                                 div()
                                     .text_sm()
@@ -460,6 +557,8 @@ impl Render for RootView {
                 let source_ref = Rc::clone(source);
                 let widths = vis_widths;
                 let dragging_fast = self.dragging.is_some() && !self.drag_idle;
+                let selected = self.selected_cell;
+                let view_entity = cx.entity().downgrade();
                 let data_rows = uniform_list(
                     "data-rows",
                     row_count,
@@ -476,13 +575,31 @@ impl Render for RootView {
                                 // During drag: show data if cached (free), empty if not (skip I/O)
                                 let show_data = !dragging_fast || source_ref.is_cached(row_idx);
                                 for (i, col_idx) in (vis_first..vis_last).enumerate() {
+                                    let is_selected = selected == Some((row_idx, col_idx));
+                                    let cell_bg = if is_selected {
+                                        rgb(0x45475a)
+                                    } else {
+                                        bg
+                                    };
                                     let mut cell = div()
+                                        .id(ElementId::NamedInteger("cell".into(), (row_idx * 10000 + col_idx) as u64))
                                         .w(px(widths[i]))
                                         .h(px(ROW_HEIGHT))
                                         .border_r_1()
-                                        .border_color(rgb(0x45475a));
+                                        .border_color(rgb(0x45475a))
+                                        .bg(cell_bg)
+                                        .cursor_pointer();
                                     if show_data {
+                                        let view = view_entity.clone();
                                         cell = cell
+                                            .on_click(move |event: &ClickEvent, window, cx| {
+                                                if let Some(entity) = view.upgrade() {
+                                                    let count = event.click_count();
+                                                    entity.update(cx, |this, cx| {
+                                                        this.select_and_maybe_copy(row_idx, col_idx, count, window, cx);
+                                                    });
+                                                }
+                                            })
                                             .px_2()
                                             .flex()
                                             .items_center()
@@ -637,8 +754,9 @@ impl Render for RootView {
             }
         };
 
-        div()
+        let mut root = div()
             .id("root")
+            .relative()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::scroll_up))
             .on_action(cx.listener(Self::scroll_down))
@@ -646,10 +764,35 @@ impl Render for RootView {
             .on_action(cx.listener(Self::scroll_right))
             .on_action(cx.listener(Self::page_up))
             .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::copy_cell))
             .on_mouse_move(cx.listener(Self::on_global_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
             .size_full()
             .bg(rgb(0x1e1e2e))
-            .child(content)
+            .child(content);
+
+        // Toast notification overlay
+        if let Some(msg) = &self.toast {
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom(px(24.0))
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x45475a))
+                            .text_sm()
+                            .text_color(rgb(0xcdd6f4))
+                            .child(msg.clone()),
+                    ),
+            );
+        }
+
+        root
     }
 }
