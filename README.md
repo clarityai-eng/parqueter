@@ -16,20 +16,7 @@ A fast, native Parquet file viewer built with Rust and [GPUI](https://github.com
 
 ## Screenshot
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  funds_DEV.parquet                                       │
-│  137 columns · 571220 rows                               │
-├─────┬──────────────┬──────────────┬──────────────────────┤
-│  #  │ ISIN         │ METRIC_VALUE │ REPORTING_LEVEL      │
-│     │ #1 type: Utf8│ #2 type: F64 │ #3         type: Utf8│
-├─────┼──────────────┼──────────────┼──────────────────────┤
-│   1 │ GB00BS6XJS94 │ 7.176532     │ NOT_APPLICABLE       │
-│   2 │ GB00BS6XJR87 │ 7.176532     │ NOT_APPLICABLE       │
-│   3 │ BR05OECTF002 │ 10.61717     │ NOT_APPLICABLE       │
-│ ... │ ...          │ ...          │ ...                  │
-└─────┴──────────────┴──────────────┴──────────────────────┘
-```
+![Parqueter screenshot](resources/screenshot.png)
 
 ## Requirements
 
