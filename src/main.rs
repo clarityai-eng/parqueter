@@ -1,11 +1,14 @@
+mod data;
 mod schema;
 mod ui;
 
 use std::path::Path;
+use std::rc::Rc;
 
 use gpui::*;
 use gpui_platform::application;
 
+use crate::data::InMemorySource;
 use crate::ui::{AppState, RootView};
 
 fn main() {
@@ -16,13 +19,16 @@ fn main() {
             if !path.exists() {
                 AppState::Error(format!("File not found: {path_str}"))
             } else {
-                match schema::read_schema(path) {
-                    Ok(columns) => {
+                match InMemorySource::load(path) {
+                    Ok(source) => {
                         let file_name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| path_str.clone());
-                        AppState::Loaded { file_name, columns }
+                        AppState::Loaded {
+                            file_name,
+                            source: Rc::new(source),
+                        }
                     }
                     Err(e) => AppState::Error(e),
                 }
@@ -31,19 +37,27 @@ fn main() {
     };
 
     application().run(move |cx: &mut App| {
+        ui::register_actions(cx);
+
         let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Parqueter".into()),
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Parqueter".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| RootView::new(state)),
-        )
-        .unwrap();
+                },
+                |window, cx| {
+                    let view = cx.new(|cx| RootView::new(state, cx));
+                    view.focus_handle(cx).focus(window, cx);
+                    view
+                },
+            )
+            .unwrap();
+        let _ = window;
         cx.activate(true);
     });
 }
