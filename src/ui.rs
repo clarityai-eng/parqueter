@@ -8,8 +8,13 @@ const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
 const HEADER_HEIGHT: f32 = 58.0;
 const SCROLL_STEP: f32 = 100.0;
-const SCROLLBAR_SIZE: f32 = 8.0;
+const SCROLLBAR_SIZE: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;
+
+fn to_f32(p: Pixels) -> f32 {
+    let v: f32 = p.into();
+    v
+}
 
 actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight]);
 
@@ -30,6 +35,12 @@ pub enum AppState {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum DragTarget {
+    Vertical,
+    Horizontal,
+}
+
 pub struct RootView {
     state: AppState,
     col_widths: Vec<f32>,
@@ -39,6 +50,15 @@ pub struct RootView {
     v_scroll_handle: UniformListScrollHandle,
     scroll_row: usize,
     h_offset: f32,
+    // Scrollbar drag state
+    dragging: Option<DragTarget>,
+    drag_start_pos: f32,       // mouse position when drag started
+    drag_start_offset: f32,    // scroll offset when drag started
+    // Cached layout dimensions (updated each render)
+    v_track_height: f32,
+    h_track_width: f32,
+    v_max_offset: f32,
+    h_max_offset: f32,
 }
 
 impl RootView {
@@ -63,6 +83,13 @@ impl RootView {
             v_scroll_handle: UniformListScrollHandle::new(),
             scroll_row: 0,
             h_offset: 0.0,
+            dragging: None,
+            drag_start_pos: 0.0,
+            drag_start_offset: 0.0,
+            v_track_height: 0.0,
+            h_track_width: 0.0,
+            v_max_offset: 0.0,
+            h_max_offset: 0.0,
         }
     }
 
@@ -114,70 +141,139 @@ impl RootView {
     }
 
     fn scroll_right(&mut self, _: &ScrollRight, window: &mut Window, _cx: &mut Context<Self>) {
-        self.h_offset = (self.h_offset + SCROLL_STEP).min(self.data_width);
+        self.h_offset = (self.h_offset + SCROLL_STEP).min(self.h_max_offset);
         window.refresh();
     }
 
-    /// Render a vertical scrollbar. Returns (track, needs_scrollbar).
-    fn vertical_scrollbar(&self, track_height: f32) -> Option<Div> {
+    // -- Scrollbar metrics --
+
+    fn v_scroll_metrics(&self, track_height: f32) -> Option<(f32, f32, f32)> {
         let state = self.v_scroll_handle.0.borrow();
-        let max_off_f: f32 = state.base_handle.max_offset().y.into();
-        if max_off_f <= 0.0 {
+        let max_off: f32 = state.base_handle.max_offset().y.into();
+        if max_off <= 0.0 {
             return None;
         }
         let cur_off: f32 = (-state.base_handle.offset().y).into();
-        let ratio = (cur_off / max_off_f).clamp(0.0, 1.0);
-
-        // thumb size proportional to viewport/content
-        let content_h = track_height + max_off_f;
+        let ratio = (cur_off / max_off).clamp(0.0, 1.0);
+        let content_h = track_height + max_off;
         let thumb_h = (track_height / content_h * track_height).max(SCROLLBAR_MIN_THUMB);
         let thumb_top = ratio * (track_height - thumb_h);
-
-        Some(
-            div()
-                .absolute()
-                .right_0()
-                .top(px(HEADER_HEIGHT))
-                .w(px(SCROLLBAR_SIZE))
-                .h(px(track_height))
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(thumb_top))
-                        .w(px(SCROLLBAR_SIZE))
-                        .h(px(thumb_h))
-                        .rounded(px(SCROLLBAR_SIZE / 2.0))
-                        .bg(rgb(0x585b70)),
-                ),
-        )
+        Some((thumb_h, thumb_top, max_off))
     }
 
-    /// Render a horizontal scrollbar.
-    fn horizontal_scrollbar(&self, track_width: f32) -> Option<Div> {
-        if self.data_width <= track_width {
+    fn h_scroll_metrics(&self, track_width: f32) -> Option<(f32, f32)> {
+        if self.h_max_offset <= 0.0 {
             return None;
         }
-        let ratio = self.h_offset / self.data_width;
+        let ratio = self.h_offset / self.h_max_offset;
         let thumb_w = (track_width / self.data_width * track_width).max(SCROLLBAR_MIN_THUMB);
         let thumb_left = ratio * (track_width - thumb_w);
+        Some((thumb_w, thumb_left))
+    }
 
-        Some(
-            div()
-                .absolute()
-                .bottom_0()
-                .left(px(ROW_NUM_WIDTH))
-                .w(px(track_width))
-                .h(px(SCROLLBAR_SIZE))
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(thumb_left))
-                        .w(px(thumb_w))
-                        .h(px(SCROLLBAR_SIZE))
-                        .rounded(px(SCROLLBAR_SIZE / 2.0))
-                        .bg(rgb(0x585b70)),
-                ),
-        )
+    // -- Scrollbar drag handlers --
+
+    fn on_v_track_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.v_track_height <= 0.0 || self.v_max_offset <= 0.0 {
+            return;
+        }
+        // Jump: map click Y position to scroll offset
+        // event.position is in window coordinates; track starts at file_header_height + HEADER_HEIGHT
+        let file_header_h = to_f32(window.viewport_size().height) - self.v_track_height - HEADER_HEIGHT;
+        let click_in_track = to_f32(event.position.y) - file_header_h - HEADER_HEIGHT;
+        let ratio = (click_in_track / self.v_track_height).clamp(0.0, 1.0);
+        let target_row = (ratio * self.row_count() as f32) as usize;
+        self.scroll_row = target_row.min(self.row_count().saturating_sub(1));
+        self.v_scroll_handle
+            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
+
+        // Start drag
+        self.dragging = Some(DragTarget::Vertical);
+        self.drag_start_pos = to_f32(event.position.y);
+        let state = self.v_scroll_handle.0.borrow();
+        self.drag_start_offset = to_f32(-state.base_handle.offset().y);
+        window.refresh();
+    }
+
+    fn on_h_track_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.h_track_width <= 0.0 {
+            return;
+        }
+        // Jump: map click X to h_offset
+        let click_in_track = to_f32(event.position.x) - ROW_NUM_WIDTH;
+        let ratio = (click_in_track / self.h_track_width).clamp(0.0, 1.0);
+        self.h_offset = (ratio * self.h_max_offset).min(self.h_max_offset);
+
+        // Start drag
+        self.dragging = Some(DragTarget::Horizontal);
+        self.drag_start_pos = to_f32(event.position.x);
+        self.drag_start_offset = self.h_offset;
+        window.refresh();
+    }
+
+    fn on_global_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.dragging else { return };
+        match target {
+            DragTarget::Vertical => {
+                if self.v_track_height <= 0.0 || self.v_max_offset <= 0.0 {
+                    return;
+                }
+                let delta_px = to_f32(event.position.y) - self.drag_start_pos;
+                // Convert pixel delta to scroll offset delta
+                let scale = self.v_max_offset / self.v_track_height;
+                let new_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.v_max_offset);
+                // Convert offset to row index
+                let row_count = self.row_count();
+                if row_count > 0 {
+                    let ratio = new_offset / self.v_max_offset;
+                    self.scroll_row = ((ratio * row_count as f32) as usize).min(row_count - 1);
+                    self.v_scroll_handle
+                        .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
+                }
+                // Also set the raw pixel offset for smooth tracking
+                {
+                    let state = self.v_scroll_handle.0.borrow();
+                    let current_x = state.base_handle.offset().x;
+                    state
+                        .base_handle
+                        .set_offset(point(current_x, px(-new_offset)));
+                }
+                window.refresh();
+            }
+            DragTarget::Horizontal => {
+                if self.h_track_width <= 0.0 {
+                    return;
+                }
+                let delta_px = to_f32(event.position.x) - self.drag_start_pos;
+                let scale = self.h_max_offset / self.h_track_width;
+                self.h_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.h_max_offset);
+                window.refresh();
+            }
+        }
+    }
+
+    fn on_global_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.dragging = None;
     }
 }
 
@@ -232,7 +328,6 @@ impl Render for RootView {
                     );
 
                 // -- Column header row --
-                // Fixed row-num cell + clipped data area (viewport_w wide)
                 let header_bg = rgb(0x313244);
                 let mut header_data = div().flex().ml(px(spacer));
                 for (i, col) in (vis_first..vis_last).enumerate() {
@@ -272,7 +367,6 @@ impl Render for RootView {
                     .flex()
                     .h(px(HEADER_HEIGHT))
                     .child(
-                        // Fixed row-number cell
                         div()
                             .w(px(ROW_NUM_WIDTH))
                             .h(px(HEADER_HEIGHT))
@@ -286,7 +380,6 @@ impl Render for RootView {
                             .child(div().text_sm().text_color(rgb(0x6c7086)).child("#")),
                     )
                     .child(
-                        // Clipped viewport for header columns
                         div()
                             .w(px(viewport_w))
                             .h(px(HEADER_HEIGHT))
@@ -309,7 +402,6 @@ impl Render for RootView {
                                     rgb(0x181825)
                                 };
 
-                                // Data cells
                                 let mut data_cells = div().flex().ml(px(spacer));
                                 for (i, col_idx) in (vis_first..vis_last).enumerate() {
                                     data_cells = data_cells.child(
@@ -340,7 +432,6 @@ impl Render for RootView {
                                     .h(px(ROW_HEIGHT))
                                     .bg(bg)
                                     .child(
-                                        // Fixed row-number cell
                                         div()
                                             .w(px(ROW_NUM_WIDTH))
                                             .h(px(ROW_HEIGHT))
@@ -358,7 +449,6 @@ impl Render for RootView {
                                             ),
                                     )
                                     .child(
-                                        // Clipped viewport for data columns
                                         div()
                                             .w(px(viewport_w))
                                             .h(px(ROW_HEIGHT))
@@ -372,8 +462,69 @@ impl Render for RootView {
                 .flex_1()
                 .track_scroll(&self.v_scroll_handle);
 
+                // -- Compute layout dimensions for scrollbars --
                 let viewport_h: f32 = (window.viewport_size().height - px(HEADER_HEIGHT)).into();
-                let body_h = viewport_h - HEADER_HEIGHT; // approximate data area height
+                let body_h = viewport_h - HEADER_HEIGHT;
+                self.v_track_height = body_h;
+                self.h_track_width = viewport_w;
+                self.h_max_offset = (self.data_width - viewport_w).max(0.0);
+
+                // Cache v_max_offset for drag handler
+                {
+                    let state = self.v_scroll_handle.0.borrow();
+                    self.v_max_offset = state.base_handle.max_offset().y.into();
+                }
+
+                // -- Scrollbars --
+                let v_scrollbar = self.v_scroll_metrics(body_h).map(|(thumb_h, thumb_top, _)| {
+                    div()
+                        .id("v-scrollbar-track")
+                        .absolute()
+                        .right_0()
+                        .top(px(HEADER_HEIGHT))
+                        .w(px(SCROLLBAR_SIZE))
+                        .h(px(body_h))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::on_v_track_click),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(thumb_top))
+                                .w(px(SCROLLBAR_SIZE))
+                                .h(px(thumb_h))
+                                .rounded(px(SCROLLBAR_SIZE / 2.0))
+                                .bg(rgb(0x585b70))
+                                .cursor_pointer(),
+                        )
+                });
+
+                let h_scrollbar = self.h_scroll_metrics(viewport_w).map(|(thumb_w, thumb_left)| {
+                    div()
+                        .id("h-scrollbar-track")
+                        .absolute()
+                        .bottom_0()
+                        .left(px(ROW_NUM_WIDTH))
+                        .w(px(viewport_w))
+                        .h(px(SCROLLBAR_SIZE))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::on_h_track_click),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(thumb_left))
+                                .w(px(thumb_w))
+                                .h(px(SCROLLBAR_SIZE))
+                                .rounded(px(SCROLLBAR_SIZE / 2.0))
+                                .bg(rgb(0x585b70))
+                                .cursor_pointer(),
+                        )
+                });
 
                 let body = div()
                     .flex()
@@ -383,7 +534,6 @@ impl Render for RootView {
                     .child(header_row)
                     .child(data_rows);
 
-                // Main layout with scrollbar overlays
                 let mut table_area = div()
                     .relative()
                     .flex()
@@ -392,11 +542,11 @@ impl Render for RootView {
                     .min_h_0()
                     .child(body);
 
-                if let Some(v_bar) = self.vertical_scrollbar(body_h) {
-                    table_area = table_area.child(v_bar);
+                if let Some(bar) = v_scrollbar {
+                    table_area = table_area.child(bar);
                 }
-                if let Some(h_bar) = self.horizontal_scrollbar(viewport_w) {
-                    table_area = table_area.child(h_bar);
+                if let Some(bar) = h_scrollbar {
+                    table_area = table_area.child(bar);
                 }
 
                 div()
@@ -416,6 +566,8 @@ impl Render for RootView {
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::scroll_left))
             .on_action(cx.listener(Self::scroll_right))
+            .on_mouse_move(cx.listener(Self::on_global_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
             .size_full()
             .bg(rgb(0x1e1e2e))
             .child(content)
