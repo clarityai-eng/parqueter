@@ -12,7 +12,7 @@ use crate::ui::{AppState, RootView};
 
 fn main() {
     let state = match std::env::args().nth(1) {
-        None => AppState::Error("Usage: parqueter <file.parquet>".to_string()),
+        None => AppState::Error("Drop a file or press Ctrl+O to open a Parquet file".to_string()),
         Some(path_str) => {
             let path = Path::new(&path_str);
             if !path.exists() {

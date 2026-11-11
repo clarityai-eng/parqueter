@@ -48,6 +48,7 @@ Note: file paths with spaces must be quoted: `./target/release/parqueter "path/t
 | Page Up/Down | Scroll 200 rows |
 | Arrow Left/Right | Scroll horizontally |
 | Ctrl+C | Copy selected cell to clipboard |
+| Ctrl+O | Open file picker |
 | Double-click | Select cell + copy to clipboard |
 
 ## Architecture

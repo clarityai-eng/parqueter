@@ -21,7 +21,7 @@ fn to_f32(p: Pixels) -> f32 {
 const ROW_STEP: usize = 20;
 const PAGE_STEP: usize = 200;
 
-actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown, CopyCell]);
+actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown, CopyCell, OpenFile]);
 
 pub fn register_actions(cx: &mut App) {
     cx.bind_keys([
@@ -32,6 +32,7 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("pageup", PageUp, None),
         KeyBinding::new("pagedown", PageDown, None),
         KeyBinding::new("ctrl-c", CopyCell, None),
+        KeyBinding::new("ctrl-o", OpenFile, None),
     ]);
 }
 
@@ -200,6 +201,65 @@ impl RootView {
         })
         .detach();
         window.refresh();
+    }
+
+    fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Parquet file".into()),
+        });
+        cx.spawn_in(window, async move |_this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.into_iter().next() {
+                    cx.update(|window, app| {
+                        if let Some(entity) = _this.upgrade() {
+                            entity.update(app, |view, cx| {
+                                view.load_file(&path, window, cx);
+                            });
+                        }
+                    }).ok();
+                }
+            }
+        }).detach();
+    }
+
+    fn load_file(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::data::LazyParquetSource;
+
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        match LazyParquetSource::open(path) {
+            Ok(source) => {
+                let source: Rc<dyn DataSource> = Rc::new(source);
+                let col_widths = source.column_widths();
+                let mut col_positions = Vec::with_capacity(col_widths.len());
+                let mut acc = 0.0f32;
+                for &w in &col_widths {
+                    col_positions.push(acc);
+                    acc += w;
+                }
+                let digits = format!("{}", source.row_count()).len();
+                self.row_num_width = (digits as f32 * 9.0 + 24.0).max(ROW_NUM_WIDTH);
+                self.data_width = acc;
+                self.col_widths = col_widths;
+                self.col_positions = col_positions;
+                self.state = AppState::Loaded { file_name, source };
+                self.scroll_row = 0;
+                self.h_offset = 0.0;
+                self.selected_cell = None;
+                self.v_scroll_handle = UniformListScrollHandle::new();
+                self.show_toast(format!("Opened: {}", path.display()), window, cx);
+            }
+            Err(e) => {
+                self.state = AppState::Error(e);
+                window.refresh();
+            }
+        }
     }
 
     fn cell_text_for_selection(&self, row: usize, col: usize) -> Option<String> {
@@ -437,19 +497,42 @@ impl Focusable for RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.state {
-            AppState::Error(msg) => div()
-                .flex()
-                .flex_col()
-                .size_full()
-                .justify_center()
-                .items_center()
-                .child(
-                    div()
-                        .text_color(rgb(0xf38ba8))
-                        .text_xl()
-                        .child(msg.clone()),
-                )
-                .into_any_element(),
+            AppState::Error(msg) => {
+                let view = cx.entity().downgrade();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_color(rgb(0xf38ba8))
+                            .text_xl()
+                            .child(msg.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("open-file-btn")
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x45475a))
+                            .text_color(rgb(0xcdd6f4))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x585b70)))
+                            .child("Open File (Ctrl+O)")
+                            .on_click(move |_, window, cx| {
+                                if let Some(entity) = view.upgrade() {
+                                    entity.update(cx, |this, cx| {
+                                        this.open_file(&OpenFile, window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                    .into_any_element()
+            }
 
             AppState::Loaded { file_name, source } => {
                 let col_count = source.col_count();
@@ -765,6 +848,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::page_up))
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::copy_cell))
+            .on_action(cx.listener(Self::open_file))
             .on_mouse_move(cx.listener(Self::on_global_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
             .size_full()
