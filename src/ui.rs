@@ -50,6 +50,7 @@ enum DragTarget {
 
 pub struct RootView {
     state: AppState,
+    row_num_width: f32,
     col_widths: Vec<f32>,
     col_positions: Vec<f32>,
     data_width: f32,
@@ -72,9 +73,14 @@ pub struct RootView {
 
 impl RootView {
     pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
-        let col_widths = match &state {
-            AppState::Loaded { source, .. } => source.column_widths(),
-            _ => vec![],
+        let (col_widths, row_num_width) = match &state {
+            AppState::Loaded { source, .. } => {
+                let widths = source.column_widths();
+                let digits = format!("{}", source.row_count()).len();
+                let w = (digits as f32 * 9.0 + 24.0).max(ROW_NUM_WIDTH);
+                (widths, w)
+            }
+            _ => (vec![], ROW_NUM_WIDTH),
         };
         let mut col_positions = Vec::with_capacity(col_widths.len());
         let mut acc = 0.0f32;
@@ -85,6 +91,7 @@ impl RootView {
         let data_width = acc;
         Self {
             state,
+            row_num_width,
             col_widths,
             col_positions,
             data_width,
@@ -243,7 +250,7 @@ impl RootView {
             return;
         }
         // Jump: map click X to h_offset
-        let click_in_track = to_f32(event.position.x) - ROW_NUM_WIDTH;
+        let click_in_track = to_f32(event.position.x) - self.row_num_width;
         let ratio = (click_in_track / self.h_track_width).clamp(0.0, 1.0);
         self.h_offset = (ratio * self.h_max_offset).min(self.h_max_offset);
 
@@ -365,7 +372,8 @@ impl Render for RootView {
             AppState::Loaded { file_name, source } => {
                 let col_count = source.col_count();
                 let row_count = source.row_count();
-                let viewport_w: f32 = (window.viewport_size().width - px(ROW_NUM_WIDTH)).into();
+                let row_num_w = self.row_num_width;
+                let viewport_w: f32 = (window.viewport_size().width - px(row_num_w)).into();
                 let (vis_first, vis_last, spacer) = self.visible_col_range(viewport_w);
                 let vis_widths: Vec<f32> = self.col_widths[vis_first..vis_last].to_vec();
 
@@ -429,7 +437,7 @@ impl Render for RootView {
                     .h(px(HEADER_HEIGHT))
                     .child(
                         div()
-                            .w(px(ROW_NUM_WIDTH))
+                            .w(px(row_num_w))
                             .h(px(HEADER_HEIGHT))
                             .px_2()
                             .flex()
@@ -499,7 +507,7 @@ impl Render for RootView {
                                     .bg(bg)
                                     .child(
                                         div()
-                                            .w(px(ROW_NUM_WIDTH))
+                                            .w(px(row_num_w))
                                             .h(px(ROW_HEIGHT))
                                             .px_2()
                                             .flex()
@@ -576,7 +584,7 @@ impl Render for RootView {
                         .id("h-scrollbar-track")
                         .absolute()
                         .bottom_0()
-                        .left(px(ROW_NUM_WIDTH))
+                        .left(px(row_num_w))
                         .w(px(viewport_w))
                         .h(px(SCROLLBAR_SIZE))
                         .cursor_pointer()

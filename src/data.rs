@@ -227,17 +227,24 @@ fn append_batch_rows(batch: &RecordBatch, rows: &mut Vec<Vec<String>>) {
     }
 }
 
-/// Compute per-column pixel widths by sampling column names and the first batch of rows.
+/// Compute per-column pixel widths from the max of:
+/// - column name length
+/// - header subtitle: "#N" + gap + "type: X" (col number + type label)
+/// - longest cell value in the first 1000 rows
 fn compute_column_widths(source: &dyn DataSource) -> Vec<f32> {
     let col_count = source.col_count();
     let sample_rows = source.row_count().min(1000);
-
     (0..col_count)
         .map(|col| {
-            // Start with column name length
-            let mut max_len = source.column_name(col).len();
+            let name_len = source.column_name(col).len();
 
-            // Sample first N rows for widest value
+            // Subtitle: "#N" (left) + "  " gap + "type: X" (right)
+            let num_str = format!("#{}", col + 1);
+            let type_str = format!("type: {}", source.column_type(col));
+            let subtitle_len = num_str.len() + 2 + type_str.len(); // 2 chars gap
+
+            let mut max_len = name_len.max(subtitle_len);
+
             for row in 0..sample_rows {
                 let val = source.cell(row, col);
                 max_len = max_len.max(val.len());
