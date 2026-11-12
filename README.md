@@ -18,6 +18,9 @@ A fast, native Parquet file viewer built with Rust and [GPUI](https://github.com
 
 ![Parqueter screenshot](resources/screenshot.png)
 
+## Download
+Take the latest binary for your platform in [Releases](https://github.com/clarityai-eng/parqueter/releases)
+
 ## Requirements
 
 - **Rust nightly** (GPUI requires unstable features)
