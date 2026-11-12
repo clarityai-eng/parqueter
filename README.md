@@ -3,18 +3,6 @@
 # What's this project and how to use it
 A fast, native Parquet file viewer built with Rust and [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the GPU-accelerated UI framework from the [Zed](https://zed.dev) editor team).
 
-## Features
-
-- **Instant startup** — reads only Parquet metadata on open, no full file load
-- **Lazy batch loading** — row groups loaded on demand with LRU cache and adjacent-batch prefetching
-- **Virtualized rendering** — only visible rows and columns are rendered, handles files with 500K+ rows and 100+ columns smoothly
-- **2D scrolling** — vertical (mouse wheel, arrow keys, Page Up/Down, draggable scrollbar) and horizontal (arrow keys, draggable scrollbar)
-- **Pinned row numbers** — row number column stays fixed during horizontal scroll
-- **Pinned column headers** — headers stay visible during vertical scroll
-- **Auto-sized columns** — column widths adapt to column names, types, and cell content
-- **Cell selection & copy** — click to select, double-click or Ctrl+C to copy to clipboard, with toast notification
-- **Smooth scrollbar dragging** — deferred data loading during fast drag, instant data display when pausing
-
 ## Screenshot
 
 ![Parqueter screenshot](resources/screenshot.png)
