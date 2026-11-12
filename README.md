@@ -1,5 +1,6 @@
 # Parqueter
 
+# What's this project and how to use it
 A fast, native Parquet file viewer built with Rust and [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the GPU-accelerated UI framework from the [Zed](https://zed.dev) editor team).
 
 ## Features
@@ -21,6 +22,8 @@ A fast, native Parquet file viewer built with Rust and [GPUI](https://github.com
 ## Download
 Take the latest binary for your platform in [Releases](https://github.com/clarityai-eng/parqueter/releases)
 
+
+# Development
 ## Requirements
 
 - **Rust nightly** (GPUI requires unstable features)
