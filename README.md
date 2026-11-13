@@ -7,8 +7,23 @@ A fast, native Parquet file viewer built with Rust and [GPUI](https://github.com
 
 ![Parqueter screenshot](resources/screenshot.png)
 
-## Download
-Take the latest binary for your platform in [Releases](https://github.com/clarityai-eng/parqueter/releases)
+## Install
+
+### macOS and Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/clarityai-eng/parqueter/master/install.sh | sh
+```
+
+On macOS this installs `Parqueter.app` into `~/Applications`, so it shows up in Spotlight and Launchpad and can open `.parquet` files from Finder. It also links the `parqueter` command into `~/.local/bin`. On Linux it installs the `parqueter` binary into `~/.local/bin`.
+
+To make Parqueter the default app for `.parquet` files: in Finder, select any `.parquet` file, open **Get Info** (Cmd+I), choose Parqueter under **Open with**, and click **Change All…**.
+
+> **Why a script and not a DMG?** The app is not signed with an Apple Developer ID, so a browser download would trigger the "Apple could not verify…" Gatekeeper dialog. Files downloaded with `curl` are not quarantined, so the script avoids it.
+
+### Manual download
+
+Take the latest build for your platform in [Releases](https://github.com/clarityai-eng/parqueter/releases).
 
 
 # Development
@@ -31,6 +46,14 @@ cargo build --release
 # Run
 ./target/release/parqueter path/to/file.parquet
 ```
+
+On macOS without full Xcode (Command Line Tools only), GPUI cannot precompile its Metal shaders. Build with runtime shader compilation instead:
+
+```bash
+cargo build --release --features gpui_platform/runtime_shaders
+```
+
+To build the `.app` bundle locally: `scripts/bundle-macos.sh target/release/parqueter 0.0.0-dev target/bundle`
 
 Note: file paths with spaces must be quoted: `./target/release/parqueter "path/to/my file.parquet"`
 

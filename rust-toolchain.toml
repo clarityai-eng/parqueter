@@ -1,2 +1,3 @@
 [toolchain]
-channel = "nightly"
+# Pinned: nightly-2026-11-12 hits an internal compiler error in pathfinder_simd (a GPUI dependency).
+channel = "nightly-2026-11-10"

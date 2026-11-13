@@ -225,7 +225,7 @@ impl RootView {
         }).detach();
     }
 
-    fn load_file(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn load_file(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
         use crate::data::LazyParquetSource;
 
         let file_name = path
