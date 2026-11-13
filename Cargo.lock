@@ -3783,10 +3783,12 @@ dependencies = [
  "arrow-array",
  "arrow-cast",
  "arrow-schema",
+ "futures",
  "gpui",
  "gpui_platform",
  "lru",
  "parquet",
+ "url",
 ]
 
 [[package]]
