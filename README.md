@@ -67,6 +67,24 @@ To build the `.app` bundle locally: `scripts/bundle-macos.sh target/release/parq
 
 Note: file paths with spaces must be quoted: `./target/release/parqueter "path/to/my file.parquet"`
 
+## Testing
+
+**Run the tests before merging any change.** CI does not run them yet.
+
+```bash
+cargo test
+
+# macOS without full Xcode
+cargo test --features gpui_platform/runtime_shaders
+```
+
+- `data.rs` tests write small Parquet files to the temp dir and check reading, caching and formatting.
+- `ui.rs` tests open the real view in GPUI's headless test window and drive it with simulated wheel, mouse and keyboard events. They need no display.
+- Two `#[ignore]`d probes time reads against a real file:
+  `PARQUETER_PROBE_FILE=/path/file.parquet cargo test --release probe -- --ignored --nocapture`
+
+Add a test with every behaviour change. A useful check: break the code you just fixed and confirm a test fails.
+
 ## Keyboard Shortcuts
 
 | Key | Action |
@@ -93,7 +111,7 @@ src/
 - **`LazyParquetSource`** reads 256-row chunks of one column at a time (row groups can span the whole file), keeps the decoded Arrow arrays in an LRU capped at 256 MB, and formats only the visible cells (truncated to what fits on screen; copying uses the full value)
 - **Per-column sequential readers** — each column keeps its reader open after the last chunk, so scrolling forward does not re-scan from the start of the row group (matters for nested columns such as embeddings when the file has no page index)
 - **Column virtualization** — only columns overlapping the viewport are rendered (typically 3-5 of 137)
-- **Row virtualization** — GPUI's `uniform_list` renders only visible rows
+- **Row virtualization** — only visible rows are rendered, positioned from an `f64` scroll offset (GPUI's `f32` loses whole pixels past ~600k rows)
 - **Deferred loading during drag** — scrollbar dragging skips I/O for instant response, loads data after 100ms idle or on release
 
 ## License

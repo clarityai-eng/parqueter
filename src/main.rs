@@ -97,3 +97,31 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
         Err(_) => Some(PathBuf::from(url)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::file_url_to_path;
+    use std::path::PathBuf;
+
+    #[test]
+    #[cfg(unix)] // a drive-less file URL is not a valid Windows path
+    fn file_urls_become_paths() {
+        assert_eq!(
+            file_url_to_path("file:///Users/me/My%20Data/a.parquet"),
+            Some(PathBuf::from("/Users/me/My Data/a.parquet"))
+        );
+    }
+
+    #[test]
+    fn other_schemes_are_ignored() {
+        assert_eq!(file_url_to_path("https://example.com/a.parquet"), None);
+    }
+
+    #[test]
+    fn plain_paths_pass_through() {
+        assert_eq!(
+            file_url_to_path("/tmp/a b.parquet"),
+            Some(PathBuf::from("/tmp/a b.parquet"))
+        );
+    }
+}

@@ -72,7 +72,7 @@ pub enum AppState {
     Error(String),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DragTarget {
     Vertical,
     Horizontal,
@@ -110,6 +110,20 @@ impl ColumnLayout {
             col_positions,
             data_width: acc,
         }
+    }
+
+    /// Columns overlapping `[h_offset, h_offset + width)`: first, one past the last,
+    /// and the x of the first column's left edge relative to the view (<= 0).
+    fn visible_range(&self, h_offset: f32, width: f32) -> (usize, usize, f32) {
+        let n = self.col_widths.len();
+        if n == 0 {
+            return (0, 0, 0.0);
+        }
+        let right = h_offset + width;
+        // Column i ends where column i + 1 starts.
+        let first = self.col_positions[1..].partition_point(|&end| end <= h_offset).min(n - 1);
+        let last = self.col_positions.partition_point(|&pos| pos < right).min(n);
+        (first, last, self.col_positions[first] - h_offset)
     }
 }
 
@@ -169,27 +183,6 @@ impl RootView {
             scroll_gesture: OngoingScroll::default(),
             h_max_offset: 0.0,
         }
-    }
-
-    fn visible_col_range(&self, viewport_width: f32) -> (usize, usize, f32) {
-        let l = &self.layout;
-        if l.col_positions.is_empty() {
-            return (0, 0, 0.0);
-        }
-        let left = self.h_offset;
-        let right = self.h_offset + viewport_width;
-
-        let first = (0..l.col_widths.len())
-            .find(|&i| l.col_positions[i] + l.col_widths[i] > left)
-            .unwrap_or(0);
-
-        let last = l
-            .col_positions
-            .partition_point(|&pos| pos < right)
-            .min(l.col_widths.len());
-
-        let spacer = l.col_positions[first] - left;
-        (first, last, spacer)
     }
 
     fn row_count(&self) -> usize {
@@ -547,7 +540,7 @@ impl Render for RootView {
                 self.h_max_offset = (self.layout.data_width + SCROLLBAR_SIZE - viewport_w).max(0.0);
                 self.h_offset = self.h_offset.min(self.h_max_offset); // window may have grown
                 let h_scrollable = self.h_max_offset > 0.0;
-                let (vis_first, vis_last, spacer) = self.visible_col_range(viewport_w);
+                let (vis_first, vis_last, spacer) = self.layout.visible_range(self.h_offset, viewport_w);
                 let vis_widths: Vec<f32> = self.layout.col_widths[vis_first..vis_last].to_vec();
 
                 // -- Vertical geometry --
@@ -595,6 +588,7 @@ impl Render for RootView {
                     header_data = header_data.child(
                         div()
                             .id(ElementId::NamedInteger("hdr".into(), col as u64))
+                            .debug_selector(|| format!("hdr-{col}"))
                             .flex_shrink_0()
                             .w(px(vis_widths[i]))
                             .h(px(HEADER_HEIGHT))
@@ -679,6 +673,7 @@ impl Render for RootView {
                         let mut cell = div()
                             // Scoped under the row's id, so no collisions however many columns.
                             .id(col_idx)
+                            .debug_selector(|| format!("cell-{row_idx}-{col_idx}"))
                             // Fixed width: without this, flex shrinks the cells to fit
                             // the clipped row, and how much depends on h_offset.
                             .flex_shrink_0()
@@ -979,5 +974,364 @@ impl Render for RootView {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppState, ColumnLayout, DataSource, DragTarget, HEADER_HEIGHT, ROW_HEIGHT, RootView, SCROLLBAR_MIN_THUMB,
+        SCROLLBAR_SIZE, TABLE_MARGIN, register_actions, thumb_geom,
+    };
+    use gpui::{
+        Entity, Focusable, Modifiers, MouseButton, MouseMoveEvent, Pixels, Point, ScrollDelta, ScrollEvent,
+        TestAppContext, TouchPhase, VisualTestContext, point, px, size,
+    };
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    // -- Pure geometry --
+
+    #[test]
+    fn thumb_geom_sizes_and_places_the_thumb() {
+        // Everything visible, or no track: no thumb.
+        assert!(thumb_geom(0.0, 100.0, 1.0, 0.0).is_none());
+        assert!(thumb_geom(0.0, 0.0, 0.5, 0.0).is_none());
+
+        let g = thumb_geom(10.0, 200.0, 0.25, 0.0).unwrap();
+        assert_eq!((g.track_origin, g.track_len, g.thumb_len, g.thumb_start), (10.0, 200.0, 50.0, 0.0));
+        let g = thumb_geom(10.0, 200.0, 0.25, 1.0).unwrap();
+        assert_eq!(g.thumb_start, 150.0); // flush with the track end
+        let g = thumb_geom(10.0, 200.0, 0.25, 0.5).unwrap();
+        assert_eq!(g.thumb_start, 75.0);
+        // Out-of-range positions are clamped.
+        assert_eq!(thumb_geom(0.0, 200.0, 0.25, 2.0).unwrap().thumb_start, 150.0);
+        assert_eq!(thumb_geom(0.0, 200.0, 0.25, -1.0).unwrap().thumb_start, 0.0);
+        // Huge files: the thumb keeps a minimum size, and still ends flush.
+        let g = thumb_geom(0.0, 200.0, 1e-7, 1.0).unwrap();
+        assert_eq!(g.thumb_len, SCROLLBAR_MIN_THUMB);
+        assert_eq!(g.thumb_start + g.thumb_len, 200.0);
+    }
+
+    #[test]
+    fn column_layout_accumulates_positions() {
+        let source = FakeSource::new(5, &[100.0, 50.0, 200.0]);
+        let l = ColumnLayout::new(Some(&source));
+        assert_eq!(l.col_positions, vec![0.0, 100.0, 150.0]);
+        assert_eq!(l.data_width, 350.0);
+
+        // The row number column grows with the digits of the row count.
+        let small = ColumnLayout::new(Some(&FakeSource::new(5, &[100.0])));
+        let huge = ColumnLayout::new(Some(&FakeSource::new(10_000_000_000, &[100.0])));
+        assert!(huge.row_num_width > small.row_num_width);
+
+        let empty = ColumnLayout::new(None);
+        assert!(empty.col_widths.is_empty());
+        assert_eq!(empty.visible_range(0.0, 500.0), (0, 0, 0.0));
+    }
+
+    #[test]
+    fn visible_range_covers_partly_visible_columns() {
+        let l = ColumnLayout::new(Some(&FakeSource::new(5, &[100.0, 50.0, 200.0, 100.0])));
+        // Columns start at 0, 100, 150, 350; data ends at 450.
+        assert_eq!(l.visible_range(0.0, 120.0), (0, 2, 0.0));
+        assert_eq!(l.visible_range(0.0, 100.0), (0, 1, 0.0));
+        // Scrolled into the middle of column 0.
+        assert_eq!(l.visible_range(40.0, 100.0), (0, 2, -40.0));
+        // Exactly at a column edge: the previous column is gone.
+        assert_eq!(l.visible_range(100.0, 60.0), (1, 3, 0.0));
+        // Inside one wide column.
+        assert_eq!(l.visible_range(200.0, 50.0), (2, 3, -50.0));
+        // At the end.
+        assert_eq!(l.visible_range(400.0, 100.0), (3, 4, -50.0));
+    }
+
+    // -- View harness --
+
+    struct FakeSource {
+        rows: usize,
+        widths: Vec<f32>,
+    }
+
+    impl FakeSource {
+        fn new(rows: usize, widths: &[f32]) -> Self {
+            Self { rows, widths: widths.to_vec() }
+        }
+    }
+
+    impl DataSource for FakeSource {
+        fn row_count(&self) -> usize {
+            self.rows
+        }
+        fn col_count(&self) -> usize {
+            self.widths.len()
+        }
+        fn column_name(&self, _col: usize) -> &str {
+            "col"
+        }
+        fn column_type(&self, _col: usize) -> &str {
+            "Utf8"
+        }
+        fn cell(&self, row: usize, col: usize) -> String {
+            format!("{row}:{col}")
+        }
+        fn cell_full(&self, row: usize, col: usize) -> String {
+            format!("{row}:{col} full")
+        }
+        fn column_widths(&self) -> Vec<f32> {
+            self.widths.clone()
+        }
+        fn is_cached(&self, _row: usize, _col: usize) -> bool {
+            true
+        }
+    }
+
+    const WINDOW_W: f32 = 800.0;
+    const WINDOW_H: f32 = 600.0;
+
+    fn open_view<'a>(
+        cx: &'a mut TestAppContext,
+        rows: usize,
+        widths: &[f32],
+    ) -> (Entity<RootView>, &'a mut VisualTestContext) {
+        let source = Rc::new(FakeSource::new(rows, widths));
+        cx.update(register_actions);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            RootView::new(AppState::Loaded { file_name: "test.parquet".into(), source }, cx)
+        });
+        cx.simulate_resize(size(px(WINDOW_W), px(WINDOW_H)));
+        cx.update(|window, cx| view.focus_handle(cx).focus(window, cx));
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// Width of the data columns area, right of the row numbers.
+    fn viewport_w(view: &Entity<RootView>, cx: &mut VisualTestContext) -> f32 {
+        WINDOW_W - 2.0 * TABLE_MARGIN - read(view, cx, |v| v.layout.row_num_width)
+    }
+
+    /// Ten columns of 150 px: wider than the window, so both axes scroll.
+    const WIDE: &[f32] = &[150.0; 10];
+
+    fn read<R>(view: &Entity<RootView>, cx: &mut VisualTestContext, f: impl FnOnce(&RootView) -> R) -> R {
+        view.read_with(cx, |v, _| f(v))
+    }
+
+    fn wheel(cx: &mut VisualTestContext, dx: f32, dy: f32) {
+        cx.simulate_event(ScrollEvent {
+            position: point(px(WINDOW_W / 2.0), px(WINDOW_H / 2.0)),
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            touch_phase: TouchPhase::Started,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    }
+
+    fn mouse_move(cx: &mut VisualTestContext, pos: Point<Pixels>, button: Option<MouseButton>) {
+        cx.simulate_event(MouseMoveEvent { position: pos, pressed_button: button, modifiers: Modifiers::none() });
+        cx.run_until_parked();
+    }
+
+    /// Centre of the vertical thumb, in window coordinates.
+    fn v_thumb_center(view: &Entity<RootView>, cx: &mut VisualTestContext) -> Point<Pixels> {
+        let g = read(view, cx, |v| v.v_thumb.get()).expect("vertical thumb");
+        point(
+            px(WINDOW_W - TABLE_MARGIN - SCROLLBAR_SIZE / 2.0),
+            px(g.track_origin + g.thumb_start + g.thumb_len / 2.0),
+        )
+    }
+
+    #[gpui::test]
+    fn view_measures_its_geometry(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let (body, h_max) = read(&view, cx, |v| (v.body_height.get(), v.h_max_offset));
+        assert!(body > 0.0 && body < WINDOW_H - HEADER_HEIGHT, "body height {body}");
+        let viewport_w = viewport_w(&view, cx);
+        assert_eq!(h_max, 1500.0 + SCROLLBAR_SIZE - viewport_w);
+        assert!(read(&view, cx, |v| v.v_thumb.get().is_some() && v.h_thumb.get().is_some()));
+    }
+
+    // -- Wheel and trackpad --
+
+    #[gpui::test]
+    fn wheel_scrolls_and_clamps_both_axes(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        wheel(cx, 0.0, -100.0);
+        assert_eq!(read(&view, cx, |v| v.v_offset), 100.0);
+        wheel(cx, -70.0, 0.0);
+        assert_eq!(read(&view, cx, |v| v.h_offset), 70.0);
+
+        // Past the ends: clamped.
+        wheel(cx, 0.0, -1e7);
+        wheel(cx, -1e7, 0.0);
+        let (v_off, v_max, h_off, h_max) =
+            read(&view, cx, |v| (v.v_offset, v.v_max_offset(), v.h_offset, v.h_max_offset));
+        assert_eq!((v_off, h_off), (v_max, h_max));
+        // At the bottom, the last row sits right above the horizontal scrollbar.
+        let visible = read(&view, cx, |v| v.body_height.get() - SCROLLBAR_SIZE) as f64;
+        assert_eq!(1000.0 * ROW_HEIGHT as f64 - v_off, visible);
+        // At the right, the last column ends right before the vertical scrollbar.
+        let cols_w = viewport_w(&view, cx) - SCROLLBAR_SIZE;
+        assert_eq!(1500.0 - h_off, cols_w);
+
+        wheel(cx, 1e7, 0.0);
+        wheel(cx, 0.0, 1e7);
+        assert_eq!(read(&view, cx, |v| (v.v_offset, v.h_offset)), (0.0, 0.0));
+    }
+
+    #[gpui::test]
+    fn trackpad_gesture_locks_to_its_main_axis(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        // Mostly vertical swipe with some sideways drift.
+        wheel(cx, -3.0, -40.0);
+        assert_eq!(read(&view, cx, |v| (v.v_offset, v.h_offset)), (40.0, 0.0));
+    }
+
+    #[gpui::test]
+    fn small_scrolls_still_move_deep_in_huge_files(cx: &mut TestAppContext) {
+        // 10M rows is ~280M px, past where f32 can hold whole pixels.
+        let (view, cx) = open_view(cx, 10_000_000, WIDE);
+        wheel(cx, 0.0, -1e10);
+        let bottom = read(&view, cx, |v| v.v_offset);
+        assert!(bottom > 2.0e8);
+        wheel(cx, 0.0, 1.0);
+        assert_eq!(read(&view, cx, |v| v.v_offset), bottom - 1.0);
+    }
+
+    #[gpui::test]
+    fn growing_the_window_clamps_offsets(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 100, WIDE);
+        wheel(cx, -1e7, 0.0);
+        wheel(cx, 0.0, -1e7);
+        assert!(read(&view, cx, |v| v.h_offset > 0.0 && v.v_offset > 0.0));
+        cx.simulate_resize(size(px(2400.0), px(1800.0)));
+        cx.run_until_parked();
+        let (v_off, v_max, h_off, h_max) =
+            read(&view, cx, |v| (v.v_offset, v.v_max_offset(), v.h_offset, v.h_max_offset));
+        assert_eq!(h_max, 0.0); // all columns fit now
+        assert_eq!(h_off, 0.0);
+        assert!(v_off <= v_max);
+    }
+
+    #[gpui::test]
+    fn columns_keep_their_width_while_scrolling_sideways(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 100, WIDE);
+        let left = TABLE_MARGIN + read(&view, cx, |v| v.layout.row_num_width);
+        for offset in [0.0, 75.0, 300.0, 333.0] {
+            let current = read(&view, cx, |v| v.h_offset);
+            wheel(cx, current - offset, 0.0);
+            assert_eq!(read(&view, cx, |v| v.h_offset), offset);
+            let width = viewport_w(&view, cx);
+            let (first, last, _) = read(&view, cx, |v| v.layout.visible_range(v.h_offset, width));
+            for col in first..last {
+                for key in [format!("hdr-{col}"), format!("cell-0-{col}")] {
+                    let key: &'static str = Box::leak(key.into_boxed_str());
+                    let b = cx.debug_bounds(key).unwrap_or_else(|| panic!("{key} not drawn at offset {offset}"));
+                    assert_eq!(b.size.width, px(150.0), "{key} at offset {offset}");
+                    assert_eq!(b.origin.x, px(left + 150.0 * col as f32 - offset), "{key} at offset {offset}");
+                }
+            }
+        }
+    }
+
+    // -- Scrollbar dragging --
+
+    #[gpui::test]
+    fn dragging_the_thumb_follows_the_cursor(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let start = v_thumb_center(&view, cx);
+        let g0 = read(&view, cx, |v| v.v_thumb.get()).unwrap();
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        // Grabbing the thumb doesn't move it.
+        assert_eq!(read(&view, cx, |v| v.v_offset), 0.0);
+        assert_eq!(read(&view, cx, |v| v.dragging), Some(DragTarget::Vertical));
+
+        mouse_move(cx, start + point(px(0.0), px(50.0)), Some(MouseButton::Left));
+        let g1 = read(&view, cx, |v| v.v_thumb.get()).unwrap();
+        assert!((g1.thumb_start - g0.thumb_start - 50.0).abs() < 0.01, "thumb moved {}", g1.thumb_start);
+        let (off, max) = read(&view, cx, |v| (v.v_offset, v.v_max_offset()));
+        let travel = (g0.track_len - g0.thumb_len) as f64;
+        assert!((off - 50.0 * max / travel).abs() < 0.01);
+
+        // A click on the scrollbar doesn't select the cell underneath.
+        cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(read(&view, cx, |v| v.selected_cell), None);
+    }
+
+    #[gpui::test]
+    fn horizontal_thumb_drags_too(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let g = read(&view, cx, |v| v.h_thumb.get()).unwrap();
+        let start = point(
+            px(g.track_origin + g.thumb_start + g.thumb_len / 2.0),
+            px(WINDOW_H - TABLE_MARGIN - SCROLLBAR_SIZE / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        mouse_move(cx, start + point(px(1e5), px(0.0)), Some(MouseButton::Left));
+        let (off, max) = read(&view, cx, |v| (v.h_offset, v.h_max_offset));
+        assert_eq!(off, max);
+    }
+
+    #[gpui::test]
+    fn release_outside_the_window_ends_the_drag(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let start = v_thumb_center(&view, cx);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        mouse_move(cx, point(px(-200.0), px(-200.0)), Some(MouseButton::Left));
+        cx.simulate_mouse_up(point(px(-200.0), px(-200.0)), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(read(&view, cx, |v| v.dragging), None);
+
+        // Moving afterwards doesn't scroll.
+        let off = read(&view, cx, |v| v.v_offset);
+        mouse_move(cx, start + point(px(0.0), px(100.0)), None);
+        assert_eq!(read(&view, cx, |v| v.v_offset), off);
+    }
+
+    #[gpui::test]
+    fn missed_release_ends_the_drag_on_next_move(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let start = v_thumb_center(&view, cx);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        // The release happened in another app; the next move has no button held.
+        mouse_move(cx, start + point(px(0.0), px(80.0)), None);
+        assert_eq!(read(&view, cx, |v| v.dragging), None);
+        assert_eq!(read(&view, cx, |v| v.v_offset), 0.0);
+    }
+
+    #[gpui::test]
+    fn clicking_the_track_centres_the_thumb_there(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let g = read(&view, cx, |v| v.v_thumb.get()).unwrap();
+        let x = px(WINDOW_W - TABLE_MARGIN - SCROLLBAR_SIZE / 2.0);
+        // Middle of the track.
+        cx.simulate_mouse_down(point(x, px(g.track_origin + g.track_len / 2.0)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(point(x, px(g.track_origin + g.track_len / 2.0)), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let (off, max) = read(&view, cx, |v| (v.v_offset, v.v_max_offset()));
+        assert!((off / max - 0.5).abs() < 0.001, "at {}", off / max);
+        // Very end of the track.
+        cx.simulate_mouse_down(point(x, px(g.track_origin + g.track_len - 1.0)), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(read(&view, cx, |v| v.v_offset), max);
+    }
+
+    #[gpui::test]
+    fn drag_shows_data_after_a_pause(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        let start = v_thumb_center(&view, cx);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        mouse_move(cx, start + point(px(0.0), px(30.0)), Some(MouseButton::Left));
+        assert!(!read(&view, cx, |v| v.drag_idle));
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        assert!(read(&view, cx, |v| v.drag_idle));
+        // Moving again resets it.
+        mouse_move(cx, start + point(px(0.0), px(40.0)), Some(MouseButton::Left));
+        assert!(!read(&view, cx, |v| v.drag_idle));
     }
 }
