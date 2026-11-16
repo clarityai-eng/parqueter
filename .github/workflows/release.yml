@@ -84,6 +84,13 @@ jobs:
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path ${{ matrix.binary }} -DestinationPath ../../../${{ matrix.artifact }}.zip
 
+      - name: Build MSI installer (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          dotnet tool install --global wix --version 5.*
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          wix build -o ${{ matrix.artifact }}.msi -d Version=$ver -d Binary=target/${{ matrix.target }}/release/${{ matrix.binary }} packaging/windows/parqueter.wxs
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
@@ -111,3 +118,4 @@ jobs:
             parqueter-macos-x86_64.tar.gz
             parqueter-macos-x86_64-app.tar.gz
             parqueter-windows-x86_64.zip
+            parqueter-windows-x86_64.msi

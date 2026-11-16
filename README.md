@@ -21,6 +21,16 @@ To make Parqueter the default app for `.parquet` files: in Finder, select any `.
 
 > **Why a script and not a DMG?** The app is not signed with an Apple Developer ID, so a browser download would trigger the "Apple could not verify…" Gatekeeper dialog. Files downloaded with `curl` are not quarantined, so the script avoids it.
 
+### Windows
+
+Download and run the `.msi` installer from [Releases](https://github.com/clarityai-eng/parqueter/releases) — or install from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/clarityai-eng/parqueter/master/install.ps1 | iex
+```
+
+The MSI installs to `%LocalAppData%\Programs\Parqueter` and adds it to your PATH. The PowerShell script installs the binary to `~\.local\bin`.
+
 ### Manual download
 
 Take the latest build for your platform in [Releases](https://github.com/clarityai-eng/parqueter/releases).
@@ -32,7 +42,7 @@ Take the latest build for your platform in [Releases](https://github.com/clarity
 - **Rust nightly** (GPUI requires unstable features)
 - **Linux**: `libxkbcommon-dev`, `libxkbcommon-x11-dev`
 - **macOS**: Xcode + command line tools
-- **Windows**: Win32/DirectWrite (untested)
+- **Windows**: Win32/DirectWrite
 
 ## Build & Run
 

@@ -95,7 +95,7 @@ case "$os" in
       && update-desktop-database "$data_dir/applications" 2>/dev/null || true
     ;;
   *)
-    die "unsupported OS: $os (on Windows, download the .zip from https://github.com/$REPO/releases)"
+    die "unsupported OS: $os (on Windows, download the .msi or .zip from https://github.com/$REPO/releases)"
     ;;
 esac
 
