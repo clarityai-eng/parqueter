@@ -87,13 +87,16 @@ Add a test with every behaviour change. A useful check: break the code you just 
 
 ## Keyboard Shortcuts
 
+Cmd on macOS, Ctrl on Linux and Windows.
+
 | Key | Action |
 |-----|--------|
-| Arrow Up/Down | Scroll 20 rows |
-| Page Up/Down | Scroll 200 rows |
-| Arrow Left/Right | Scroll horizontally |
-| Ctrl+C | Copy selected cell to clipboard |
-| Ctrl+O | Open file picker |
+| Arrow keys | Move the selected cell; the view follows. The first press selects the top-left visible cell |
+| Page Up/Down | Move one screen of rows |
+| Home/End, Cmd+Left/Right | First/last column |
+| Cmd+Up/Down, Cmd+Home/End | First/last row |
+| Cmd+C (or Ctrl+C) | Copy selected cell to clipboard |
+| Cmd+O (or Ctrl+O) | Open file picker |
 | Double-click | Select cell + copy to clipboard |
 
 ## Architecture

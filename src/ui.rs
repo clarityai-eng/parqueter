@@ -9,14 +9,10 @@ use crate::data::DataSource;
 const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
 const HEADER_HEIGHT: f32 = 58.0;
-const SCROLL_STEP: f32 = 300.0;
 const SCROLLBAR_SIZE: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;
 /// Inset around the table so rounded window corners don't clip the scrollbars or cells.
 const TABLE_MARGIN: f32 = 10.0;
-
-const ROW_STEP: usize = 20;
-const PAGE_STEP: usize = 200;
 
 fn to_f32(p: Pixels) -> f32 {
     let v: f32 = p.into();
@@ -49,20 +45,129 @@ fn thumb_geom(track_origin: f32, track_len: f32, visible: f32, position: f32) ->
     })
 }
 
-actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown, CopyCell, OpenFile]);
+/// Returns the offset that shows `[start, start + len)` in a view of `view_len`
+/// currently at `offset`, moving as little as possible. An item that doesn't fit
+/// is aligned to its start.
+fn reveal(offset: f64, view_len: f64, start: f64, len: f64) -> f64 {
+    if start < offset || len >= view_len {
+        start
+    } else if start + len > offset + view_len {
+        start + len - view_len
+    } else {
+        offset
+    }
+}
 
-pub fn register_actions(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", ScrollUp, None),
-        KeyBinding::new("down", ScrollDown, None),
-        KeyBinding::new("left", ScrollLeft, None),
-        KeyBinding::new("right", ScrollRight, None),
+/// A cursor movement requested from the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Move {
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    FirstColumn,
+    LastColumn,
+    FirstRow,
+    LastRow,
+}
+
+/// The cell the cursor lands on after `mv`. `row` may be `RootView::HEADER_ROW`;
+/// the cursor can leave the header downwards but never enters it.
+/// Expects `rows > 0` or a header cursor, and `cols > 0`.
+fn next_cell((row, col): (usize, usize), mv: Move, rows: usize, cols: usize, page: usize) -> (usize, usize) {
+    let last_col = cols - 1;
+    let col = match mv {
+        Move::Left => col.saturating_sub(1),
+        Move::Right => (col + 1).min(last_col),
+        Move::FirstColumn => 0,
+        Move::LastColumn => last_col,
+        _ => col,
+    };
+    if rows == 0 {
+        return (row, col);
+    }
+    let last_row = rows - 1;
+    let row = if row == RootView::HEADER_ROW {
+        match mv {
+            Move::Down | Move::PageDown | Move::FirstRow => 0,
+            Move::LastRow => last_row,
+            _ => row,
+        }
+    } else {
+        match mv {
+            Move::Up => row.saturating_sub(1),
+            Move::Down => (row + 1).min(last_row),
+            Move::PageUp => row.saturating_sub(page),
+            Move::PageDown => (row + page).min(last_row),
+            Move::FirstRow => 0,
+            Move::LastRow => last_row,
+            _ => row,
+        }
+    };
+    (row, col)
+}
+
+actions!(
+    parqueter,
+    [
+        MoveUp,
+        MoveDown,
+        MoveLeft,
+        MoveRight,
+        PageUp,
+        PageDown,
+        FirstColumn,
+        LastColumn,
+        FirstRow,
+        LastRow,
+        CopyCell,
+        OpenFile
+    ]
+);
+
+/// Cmd on macOS, Ctrl elsewhere. GPUI's `secondary-` prefix needs the host OS,
+/// which `KeyBinding::new` doesn't pass, so it panics there.
+macro_rules! secondary {
+    ($key:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("cmd-", $key)
+        } else {
+            concat!("ctrl-", $key)
+        }
+    };
+}
+
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("up", MoveUp, None),
+        KeyBinding::new("down", MoveDown, None),
+        KeyBinding::new("left", MoveLeft, None),
+        KeyBinding::new("right", MoveRight, None),
         KeyBinding::new("pageup", PageUp, None),
         KeyBinding::new("pagedown", PageDown, None),
+        KeyBinding::new("home", FirstColumn, None),
+        KeyBinding::new("end", LastColumn, None),
+        KeyBinding::new(secondary!("left"), FirstColumn, None),
+        KeyBinding::new(secondary!("right"), LastColumn, None),
+        KeyBinding::new(secondary!("home"), FirstRow, None),
+        KeyBinding::new(secondary!("end"), LastRow, None),
+        KeyBinding::new(secondary!("up"), FirstRow, None),
+        KeyBinding::new(secondary!("down"), LastRow, None),
+        KeyBinding::new(secondary!("c"), CopyCell, None),
+        KeyBinding::new(secondary!("o"), OpenFile, None),
+        // Kept on macOS too, for muscle memory from earlier versions.
         KeyBinding::new("ctrl-c", CopyCell, None),
         KeyBinding::new("ctrl-o", OpenFile, None),
-    ]);
+    ]
 }
+
+pub fn register_actions(cx: &mut App) {
+    cx.bind_keys(key_bindings());
+}
+
+pub const OPEN_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
 
 pub enum AppState {
     Loaded {
@@ -154,6 +259,7 @@ pub struct RootView {
     scroll_gesture: OngoingScroll,
     // Updated each render
     h_max_offset: f32,
+    viewport_w: f32, // width of the data columns area, excluding row numbers
 }
 
 impl RootView {
@@ -182,6 +288,7 @@ impl RootView {
             h_thumb: Rc::new(Cell::new(None)),
             scroll_gesture: OngoingScroll::default(),
             h_max_offset: 0.0,
+            viewport_w: 0.0,
         }
     }
 
@@ -234,35 +341,124 @@ impl RootView {
         }
     }
 
-    fn scroll_by(&mut self, target: DragTarget, delta: f64, cx: &mut Context<Self>) {
-        let offset = self.scroll_offset(target) + delta;
-        if self.set_scroll_offset(target, offset) {
-            cx.notify();
+    // -- Keyboard cursor --
+
+    /// Height of the rows actually visible: the horizontal scrollbar covers the bottom.
+    fn visible_rows_height(&self) -> f32 {
+        let pad = if self.h_max_offset > 0.0 { SCROLLBAR_SIZE } else { 0.0 };
+        (self.body_height.get() - pad).max(0.0)
+    }
+
+    /// Width of the columns actually visible: the vertical scrollbar covers the right edge.
+    fn visible_cols_width(&self) -> f32 {
+        (self.viewport_w - SCROLLBAR_SIZE).max(0.0)
+    }
+
+    /// Rows that fit fully in the view, at least one.
+    fn page_rows(&self) -> usize {
+        ((self.visible_rows_height() / ROW_HEIGHT).floor() as usize).max(1)
+    }
+
+    /// Top-left cell that is fully visible, or the nearest partly visible one.
+    fn first_visible_cell(&self) -> (usize, usize) {
+        let l = &self.layout;
+        let row = ((self.v_offset / ROW_HEIGHT as f64).ceil() as usize).min(self.row_count().saturating_sub(1));
+        let mut col = l.col_positions.partition_point(|&p| p < self.h_offset);
+        // No column starts inside the view (one wide column covers it): take the
+        // column the view starts in.
+        if col >= l.col_positions.len() || l.col_positions[col] >= self.h_offset + self.visible_cols_width() {
+            col = col.saturating_sub(1);
+        }
+        (row, col)
+    }
+
+    /// Scrolls the least amount that shows the whole selected cell.
+    fn reveal_selection(&mut self) {
+        let Some((row, col)) = self.selected_cell else { return };
+        if row != Self::HEADER_ROW {
+            let row_h = ROW_HEIGHT as f64;
+            let offset = reveal(self.v_offset, self.visible_rows_height() as f64, row as f64 * row_h, row_h);
+            self.set_scroll_offset(DragTarget::Vertical, offset);
+        }
+        let l = &self.layout;
+        if let (Some(&start), Some(&width)) = (l.col_positions.get(col), l.col_widths.get(col)) {
+            let offset = reveal(
+                self.h_offset as f64,
+                self.visible_cols_width() as f64,
+                start as f64,
+                width as f64,
+            );
+            self.set_scroll_offset(DragTarget::Horizontal, offset);
         }
     }
 
-    fn scroll_up(&mut self, _: &ScrollUp, _window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(DragTarget::Vertical, -((ROW_STEP as f32 * ROW_HEIGHT) as f64), cx);
+    fn move_cursor(&mut self, mv: Move, cx: &mut Context<Self>) {
+        let rows = self.row_count();
+        let cols = self.layout.col_widths.len();
+        if cols == 0 {
+            return;
+        }
+        match self.selected_cell {
+            None => {
+                // The first key press only picks a starting cell.
+                if rows == 0 {
+                    return;
+                }
+                self.selected_cell = Some(self.first_visible_cell());
+            }
+            Some(cell) => {
+                let (row, col) = next_cell(cell, mv, rows, cols, self.page_rows());
+                // Page keys scroll by the rows moved, so the cursor keeps its place
+                // on screen; reveal_selection then fixes up the edges.
+                if matches!(mv, Move::PageUp | Move::PageDown) && cell.0 != Self::HEADER_ROW {
+                    let delta = (row as f64 - cell.0 as f64) * ROW_HEIGHT as f64;
+                    self.set_scroll_offset(DragTarget::Vertical, self.v_offset + delta);
+                }
+                self.selected_cell = Some((row, col));
+            }
+        }
+        self.reveal_selection();
+        cx.notify();
     }
 
-    fn scroll_down(&mut self, _: &ScrollDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(DragTarget::Vertical, (ROW_STEP as f32 * ROW_HEIGHT) as f64, cx);
+    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::Up, cx);
     }
 
-    fn page_up(&mut self, _: &PageUp, _window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(DragTarget::Vertical, -((PAGE_STEP as f32 * ROW_HEIGHT) as f64), cx);
+    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::Down, cx);
     }
 
-    fn page_down(&mut self, _: &PageDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(DragTarget::Vertical, (PAGE_STEP as f32 * ROW_HEIGHT) as f64, cx);
+    fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::Left, cx);
     }
 
-    fn scroll_left(&mut self, _: &ScrollLeft, _window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(DragTarget::Horizontal, -SCROLL_STEP as f64, cx);
+    fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::Right, cx);
     }
 
-    fn scroll_right(&mut self, _: &ScrollRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_by(DragTarget::Horizontal, SCROLL_STEP as f64, cx);
+    fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::PageUp, cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::PageDown, cx);
+    }
+
+    fn first_column(&mut self, _: &FirstColumn, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::FirstColumn, cx);
+    }
+
+    fn last_column(&mut self, _: &LastColumn, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::LastColumn, cx);
+    }
+
+    fn first_row(&mut self, _: &FirstRow, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::FirstRow, cx);
+    }
+
+    fn last_row(&mut self, _: &LastRow, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(Move::LastRow, cx);
     }
 
     /// Wheel / trackpad scrolling on both axes. Shift+wheel arrives as an X delta
@@ -514,7 +710,7 @@ impl Render for RootView {
                             .text_color(rgb(0xcdd6f4))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(0x585b70)))
-                            .child("Open File (Ctrl+O)")
+                            .child(format!("Open File ({OPEN_SHORTCUT})"))
                             .on_click(move |_, window, cx| {
                                 if let Some(entity) = view.upgrade() {
                                     entity.update(cx, |this, cx| {
@@ -539,6 +735,7 @@ impl Render for RootView {
                 // Extra SCROLLBAR_SIZE so the last column can scroll clear of the vertical scrollbar.
                 self.h_max_offset = (self.layout.data_width + SCROLLBAR_SIZE - viewport_w).max(0.0);
                 self.h_offset = self.h_offset.min(self.h_max_offset); // window may have grown
+                self.viewport_w = viewport_w;
                 let h_scrollable = self.h_max_offset > 0.0;
                 let (vis_first, vis_last, spacer) = self.layout.visible_range(self.h_offset, viewport_w);
                 let vis_widths: Vec<f32> = self.layout.col_widths[vis_first..vis_last].to_vec();
@@ -910,12 +1107,16 @@ impl Render for RootView {
             .id("root")
             .relative()
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::scroll_up))
-            .on_action(cx.listener(Self::scroll_down))
-            .on_action(cx.listener(Self::scroll_left))
-            .on_action(cx.listener(Self::scroll_right))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::move_left))
+            .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::page_up))
             .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::first_column))
+            .on_action(cx.listener(Self::last_column))
+            .on_action(cx.listener(Self::first_row))
+            .on_action(cx.listener(Self::last_row))
             .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::open_file))
             .size_full()
@@ -980,8 +1181,8 @@ impl Render for RootView {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ColumnLayout, DataSource, DragTarget, HEADER_HEIGHT, ROW_HEIGHT, RootView, SCROLLBAR_MIN_THUMB,
-        SCROLLBAR_SIZE, TABLE_MARGIN, register_actions, thumb_geom,
+        AppState, ColumnLayout, DataSource, DragTarget, HEADER_HEIGHT, Move, ROW_HEIGHT, RootView, SCROLLBAR_MIN_THUMB,
+        SCROLLBAR_SIZE, TABLE_MARGIN, key_bindings, next_cell, register_actions, reveal, thumb_geom,
     };
     use gpui::{
         Entity, Focusable, Modifiers, MouseButton, MouseMoveEvent, Pixels, Point, ScrollDelta, ScrollEvent,
@@ -989,6 +1190,63 @@ mod tests {
     };
     use std::rc::Rc;
     use std::time::Duration;
+
+    /// `KeyBinding::new` panics on a keystroke it can't parse, at app start.
+    #[test]
+    fn key_bindings_parse() {
+        assert!(!key_bindings().is_empty());
+    }
+
+    const H: usize = RootView::HEADER_ROW;
+
+    #[test]
+    fn reveal_moves_least() {
+        // Already visible: no change.
+        assert_eq!(reveal(100.0, 50.0, 110.0, 10.0), 100.0);
+        // Above / left of the view: align start.
+        assert_eq!(reveal(100.0, 50.0, 80.0, 10.0), 80.0);
+        // Below / right of the view: align end.
+        assert_eq!(reveal(100.0, 50.0, 160.0, 10.0), 120.0);
+        // Partly cut at the end.
+        assert_eq!(reveal(100.0, 50.0, 145.0, 10.0), 105.0);
+        // Larger than the view: align start.
+        assert_eq!(reveal(100.0, 50.0, 300.0, 80.0), 300.0);
+    }
+
+    #[test]
+    fn next_cell_clamps_to_edges() {
+        assert_eq!(next_cell((0, 0), Move::Up, 10, 3, 4), (0, 0));
+        assert_eq!(next_cell((0, 0), Move::Left, 10, 3, 4), (0, 0));
+        assert_eq!(next_cell((9, 2), Move::Down, 10, 3, 4), (9, 2));
+        assert_eq!(next_cell((9, 2), Move::Right, 10, 3, 4), (9, 2));
+        assert_eq!(next_cell((5, 1), Move::Down, 10, 3, 4), (6, 1));
+        assert_eq!(next_cell((5, 1), Move::Right, 10, 3, 4), (5, 2));
+    }
+
+    #[test]
+    fn next_cell_pages_and_jumps() {
+        assert_eq!(next_cell((5, 1), Move::PageDown, 10, 3, 4), (9, 1));
+        assert_eq!(next_cell((2, 1), Move::PageDown, 10, 3, 4), (6, 1));
+        assert_eq!(next_cell((2, 1), Move::PageUp, 10, 3, 4), (0, 1));
+        assert_eq!(next_cell((5, 1), Move::FirstRow, 10, 3, 4), (0, 1));
+        assert_eq!(next_cell((5, 1), Move::LastRow, 10, 3, 4), (9, 1));
+        assert_eq!(next_cell((5, 1), Move::FirstColumn, 10, 3, 4), (5, 0));
+        assert_eq!(next_cell((5, 1), Move::LastColumn, 10, 3, 4), (5, 2));
+    }
+
+    #[test]
+    fn next_cell_never_enters_header() {
+        assert_eq!(next_cell((0, 1), Move::Up, 10, 3, 4), (0, 1));
+        assert_eq!(next_cell((0, 1), Move::PageUp, 10, 3, 4), (0, 1));
+        // Leaves the header downwards, moves along it sideways.
+        assert_eq!(next_cell((H, 1), Move::Up, 10, 3, 4), (H, 1));
+        assert_eq!(next_cell((H, 1), Move::Down, 10, 3, 4), (0, 1));
+        assert_eq!(next_cell((H, 1), Move::PageDown, 10, 3, 4), (0, 1));
+        assert_eq!(next_cell((H, 1), Move::LastRow, 10, 3, 4), (9, 1));
+        assert_eq!(next_cell((H, 1), Move::Right, 10, 3, 4), (H, 2));
+        // No data rows: stays in the header.
+        assert_eq!(next_cell((H, 1), Move::Down, 0, 3, 4), (H, 1));
+    }
 
     // -- Pure geometry --
 
@@ -1094,20 +1352,22 @@ mod tests {
         rows: usize,
         widths: &[f32],
     ) -> (Entity<RootView>, &'a mut VisualTestContext) {
-        let source = Rc::new(FakeSource::new(rows, widths));
+        open_state(
+            cx,
+            AppState::Loaded {
+                file_name: "test.parquet".into(),
+                source: Rc::new(FakeSource::new(rows, widths)),
+            },
+        )
+    }
+
+    fn open_state(cx: &mut TestAppContext, state: AppState) -> (Entity<RootView>, &mut VisualTestContext) {
         cx.update(register_actions);
-        let (view, cx) = cx.add_window_view(|_, cx| {
-            RootView::new(AppState::Loaded { file_name: "test.parquet".into(), source }, cx)
-        });
+        let (view, cx) = cx.add_window_view(|_, cx| RootView::new(state, cx));
         cx.simulate_resize(size(px(WINDOW_W), px(WINDOW_H)));
         cx.update(|window, cx| view.focus_handle(cx).focus(window, cx));
         cx.run_until_parked();
         (view, cx)
-    }
-
-    /// Width of the data columns area, right of the row numbers.
-    fn viewport_w(view: &Entity<RootView>, cx: &mut VisualTestContext) -> f32 {
-        WINDOW_W - 2.0 * TABLE_MARGIN - read(view, cx, |v| v.layout.row_num_width)
     }
 
     /// Ten columns of 150 px: wider than the window, so both axes scroll.
@@ -1144,9 +1404,10 @@ mod tests {
     #[gpui::test]
     fn view_measures_its_geometry(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 1000, WIDE);
-        let (body, h_max) = read(&view, cx, |v| (v.body_height.get(), v.h_max_offset));
+        let (body, viewport_w, h_max) = read(&view, cx, |v| (v.body_height.get(), v.viewport_w, v.h_max_offset));
         assert!(body > 0.0 && body < WINDOW_H - HEADER_HEIGHT, "body height {body}");
-        let viewport_w = viewport_w(&view, cx);
+        let row_num_w = read(&view, cx, |v| v.layout.row_num_width);
+        assert_eq!(viewport_w, WINDOW_W - 2.0 * TABLE_MARGIN - row_num_w);
         assert_eq!(h_max, 1500.0 + SCROLLBAR_SIZE - viewport_w);
         assert!(read(&view, cx, |v| v.v_thumb.get().is_some() && v.h_thumb.get().is_some()));
     }
@@ -1168,10 +1429,10 @@ mod tests {
             read(&view, cx, |v| (v.v_offset, v.v_max_offset(), v.h_offset, v.h_max_offset));
         assert_eq!((v_off, h_off), (v_max, h_max));
         // At the bottom, the last row sits right above the horizontal scrollbar.
-        let visible = read(&view, cx, |v| v.body_height.get() - SCROLLBAR_SIZE) as f64;
+        let visible = read(&view, cx, |v| v.visible_rows_height()) as f64;
         assert_eq!(1000.0 * ROW_HEIGHT as f64 - v_off, visible);
         // At the right, the last column ends right before the vertical scrollbar.
-        let cols_w = viewport_w(&view, cx) - SCROLLBAR_SIZE;
+        let cols_w = read(&view, cx, |v| v.visible_cols_width());
         assert_eq!(1500.0 - h_off, cols_w);
 
         wheel(cx, 1e7, 0.0);
@@ -1221,8 +1482,7 @@ mod tests {
             let current = read(&view, cx, |v| v.h_offset);
             wheel(cx, current - offset, 0.0);
             assert_eq!(read(&view, cx, |v| v.h_offset), offset);
-            let width = viewport_w(&view, cx);
-            let (first, last, _) = read(&view, cx, |v| v.layout.visible_range(v.h_offset, width));
+            let (first, last, _) = read(&view, cx, |v| v.layout.visible_range(v.h_offset, v.viewport_w));
             for col in first..last {
                 for key in [format!("hdr-{col}"), format!("cell-0-{col}")] {
                     let key: &'static str = Box::leak(key.into_boxed_str());
@@ -1333,5 +1593,173 @@ mod tests {
         // Moving again resets it.
         mouse_move(cx, start + point(px(0.0), px(40.0)), Some(MouseButton::Left));
         assert!(!read(&view, cx, |v| v.drag_idle));
+    }
+
+    // -- Keyboard --
+
+    /// Asserts the selected cell is fully inside the visible area.
+    fn assert_selection_visible(view: &Entity<RootView>, cx: &mut VisualTestContext) {
+        read(view, cx, |v| {
+            let (row, col) = v.selected_cell.unwrap();
+            let top = row as f64 * ROW_HEIGHT as f64;
+            assert!(top >= v.v_offset, "row {row} above view");
+            assert!(top + ROW_HEIGHT as f64 <= v.v_offset + v.visible_rows_height() as f64, "row {row} below view");
+            let (start, width) = (v.layout.col_positions[col], v.layout.col_widths[col]);
+            assert!(start >= v.h_offset, "column {col} left of view");
+            let fits = width <= v.visible_cols_width();
+            assert!(
+                if fits { start + width <= v.h_offset + v.visible_cols_width() } else { start == v.h_offset },
+                "column {col} not shown"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn first_key_selects_top_left_visible_cell(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        wheel(cx, 0.0, -42.0); // 1.5 rows down
+        wheel(cx, -160.0, 0.0); // into column 1
+        cx.simulate_keystrokes("right");
+        // Row 1 is cut at the top, column 1 at the left: take the next whole ones.
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((2, 2)));
+    }
+
+    #[gpui::test]
+    fn arrows_move_and_scroll_into_view(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        cx.simulate_keystrokes("down");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((0, 0)));
+
+        let page = read(&view, cx, |v| v.page_rows());
+        for _ in 0..page + 3 {
+            cx.simulate_keystrokes("down");
+            assert_selection_visible(&view, cx);
+        }
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((page + 3, 0)));
+        // Scrolled just enough: the cursor row is the bottom visible one.
+        read(&view, cx, |v| {
+            let bottom = (page + 4) as f64 * ROW_HEIGHT as f64;
+            assert_eq!(bottom, v.v_offset + v.visible_rows_height() as f64);
+        });
+
+        for _ in 0..9 {
+            cx.simulate_keystrokes("right");
+            assert_selection_visible(&view, cx);
+        }
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((page + 3, 9)));
+        cx.simulate_keystrokes("right"); // clamped at the last column
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((page + 3, 9)));
+
+        for _ in 0..9 {
+            cx.simulate_keystrokes("left");
+            assert_selection_visible(&view, cx);
+        }
+        assert_eq!(read(&view, cx, |v| v.h_offset), 0.0);
+        for _ in 0..page + 10 {
+            cx.simulate_keystrokes("up");
+            assert_selection_visible(&view, cx);
+        }
+        assert_eq!(read(&view, cx, |v| (v.selected_cell, v.v_offset)), (Some((0, 0)), 0.0));
+    }
+
+    #[gpui::test]
+    fn columns_wider_than_the_view_align_left(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10, &[100.0, 2000.0, 100.0]);
+        cx.simulate_keystrokes("right right");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((0, 1)));
+        assert_eq!(read(&view, cx, |v| v.h_offset), 100.0);
+        assert_selection_visible(&view, cx);
+    }
+
+    #[gpui::test]
+    fn page_keys_keep_the_cursor_in_place_on_screen(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 1000, WIDE);
+        cx.simulate_keystrokes("down down down down"); // select, then row 3
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((3, 0)));
+        let page = read(&view, cx, |v| v.page_rows());
+        assert!(page > 1);
+
+        cx.simulate_keystrokes("pagedown");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((3 + page, 0)));
+        assert_eq!(read(&view, cx, |v| v.v_offset), (page as f64) * ROW_HEIGHT as f64);
+
+        cx.simulate_keystrokes("pageup");
+        assert_eq!(read(&view, cx, |v| (v.selected_cell, v.v_offset)), (Some((3, 0)), 0.0));
+
+        // Paging past the end stops on the last row, still visible.
+        for _ in 0..1000 / page + 2 {
+            cx.simulate_keystrokes("pagedown");
+        }
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((999, 0)));
+        assert_selection_visible(&view, cx);
+    }
+
+    #[gpui::test]
+    fn jump_keys_reach_the_edges(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10_000_000, WIDE);
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes(secondary!("down"));
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((9_999_999, 0)));
+        assert_eq!(read(&view, cx, |v| v.v_offset), read(&view, cx, |v| v.v_max_offset()));
+        assert_selection_visible(&view, cx);
+
+        cx.simulate_keystrokes("end");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((9_999_999, 9)));
+        assert_selection_visible(&view, cx);
+        cx.simulate_keystrokes("home");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((9_999_999, 0)));
+        cx.simulate_keystrokes(secondary!("right"));
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((9_999_999, 9)));
+        cx.simulate_keystrokes(secondary!("left"));
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((9_999_999, 0)));
+
+        cx.simulate_keystrokes(secondary!("up"));
+        assert_eq!(read(&view, cx, |v| (v.selected_cell, v.v_offset)), (Some((0, 0)), 0.0));
+        cx.simulate_keystrokes(secondary!("end"));
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((9_999_999, 0)));
+        cx.simulate_keystrokes(secondary!("home"));
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((0, 0)));
+    }
+
+    #[gpui::test]
+    fn header_cursor_moves_down_into_rows_only(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 100, WIDE);
+        view.update(cx, |v, _| v.selected_cell = Some((RootView::HEADER_ROW, 4)));
+        cx.simulate_keystrokes("up");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((RootView::HEADER_ROW, 4)));
+        cx.simulate_keystrokes("right");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((RootView::HEADER_ROW, 5)));
+        cx.simulate_keystrokes("down");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((0, 5)));
+        cx.simulate_keystrokes("up");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((0, 5)));
+    }
+
+    #[gpui::test]
+    fn keys_do_nothing_without_data(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 0, WIDE);
+        cx.simulate_keystrokes("down right pagedown end");
+        cx.simulate_keystrokes(secondary!("down"));
+        assert_eq!(read(&view, cx, |v| v.selected_cell), None);
+    }
+
+    #[gpui::test]
+    fn keys_do_nothing_on_the_error_screen(cx: &mut TestAppContext) {
+        let (view, cx) = open_state(cx, AppState::Error("x".into()));
+        cx.simulate_keystrokes("down right pagedown");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), None);
+    }
+
+    #[gpui::test]
+    fn copy_shortcuts_copy_the_full_value(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 100, WIDE);
+        cx.simulate_keystrokes("down down right");
+        assert_eq!(read(&view, cx, |v| v.selected_cell), Some((1, 1)));
+        cx.simulate_keystrokes(secondary!("c"));
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("1:1 full"));
+        assert!(read(&view, cx, |v| v.toast.is_some()));
+
+        cx.simulate_keystrokes("down ctrl-c");
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("2:1 full"));
     }
 }

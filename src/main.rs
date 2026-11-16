@@ -15,7 +15,7 @@ use crate::ui::{AppState, RootView};
 fn main() {
     // Ignore the legacy `-psn_*` argument older macOS versions pass when launching from Finder.
     let state = match std::env::args().skip(1).find(|a| !a.starts_with("-psn_")) {
-        None => AppState::Error("Drop a file or press Ctrl+O to open a Parquet file".to_string()),
+        None => AppState::Error(format!("Drop a file or press {} to open a Parquet file", ui::OPEN_SHORTCUT)),
         Some(path_str) => {
             let path = Path::new(&path_str);
             if !path.exists() {
