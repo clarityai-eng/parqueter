@@ -80,7 +80,8 @@ src/
 **Key design decisions:**
 
 - **`DataSource` trait** abstracts data access — the UI doesn't know if data comes from memory or disk
-- **`LazyParquetSource`** reads Parquet row groups on demand, caches them in an LRU (10 batches), and prefetches N±1 on cache miss
+- **`LazyParquetSource`** reads 256-row chunks of one column at a time (row groups can span the whole file), keeps the decoded Arrow arrays in an LRU capped at 256 MB, and formats only the visible cells (truncated to what fits on screen; copying uses the full value)
+- **Per-column sequential readers** — each column keeps its reader open after the last chunk, so scrolling forward does not re-scan from the start of the row group (matters for nested columns such as embeddings when the file has no page index)
 - **Column virtualization** — only columns overlapping the viewport are rendered (typically 3-5 of 137)
 - **Row virtualization** — GPUI's `uniform_list` renders only visible rows
 - **Deferred loading during drag** — scrollbar dragging skips I/O for instant response, loads data after 100ms idle or on release

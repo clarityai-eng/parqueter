@@ -269,7 +269,7 @@ impl RootView {
         if row == Self::HEADER_ROW {
             Some(source.column_name(col).to_string())
         } else {
-            Some(source.cell(row, col))
+            Some(source.cell_full(row, col))
         }
     }
 
@@ -277,8 +277,8 @@ impl RootView {
         if let Some((row, col)) = self.selected_cell {
             if let Some(text) = self.cell_text_for_selection(row, col) {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                let preview = if text.len() > 40 {
-                    format!("\"{}...\" copied", &text[..37])
+                let preview = if text.chars().count() > 40 {
+                    format!("\"{}...\" copied", text.chars().take(37).collect::<String>())
                 } else {
                     format!("\"{text}\" copied")
                 };
@@ -299,8 +299,8 @@ impl RootView {
         if click_count >= 2 {
             if let Some(text) = self.cell_text_for_selection(row, col) {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                let preview = if text.len() > 40 {
-                    format!("\"{}...\" copied", &text[..37])
+                let preview = if text.chars().count() > 40 {
+                    format!("\"{}...\" copied", text.chars().take(37).collect::<String>())
                 } else {
                     format!("\"{text}\" copied")
                 };
@@ -656,8 +656,9 @@ impl Render for RootView {
 
                                 let mut data_cells = div().flex().ml(px(spacer));
                                 // During drag: show data if cached (free), empty if not (skip I/O)
-                                let show_data = !dragging_fast || source_ref.is_cached(row_idx);
                                 for (i, col_idx) in (vis_first..vis_last).enumerate() {
+                                    let show_data =
+                                        !dragging_fast || source_ref.is_cached(row_idx, col_idx);
                                     let is_selected = selected == Some((row_idx, col_idx));
                                     let cell_bg = if is_selected {
                                         rgb(0x45475a)
