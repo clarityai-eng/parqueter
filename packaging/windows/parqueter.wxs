@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v4+ source for the Parqueter MSI installer.
+  Built in CI with:  wix build -o parqueter.msi -d Version=X.Y.Z -d Binary=path\to\parqueter.exe packaging\windows\parqueter.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Parqueter"
+           Manufacturer="Clarity AI"
+           Version="$(Version)"
+           UpgradeCode="e4a7c3b1-5f2d-4e8a-9b6c-1d3f5a7e9b2c"
+           Scope="perUser">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Parqueter is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="packaging\windows\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LOCALAPPPROGRAMS" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Parqueter">
+          <Component Id="MainExecutable" Guid="a1b2c3d4-e5f6-7890-abcd-ef1234567890">
+            <File Id="ParqueterExe" Source="$(Binary)" KeyPath="yes" />
+          </Component>
+          <Component Id="PathEntry" Guid="b2c3d4e5-f6a7-8901-bcde-f12345678901">
+            <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]"
+                         Permanent="no" Part="last" Action="set" System="no" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Parqueter" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="PathEntry" />
+    </Feature>
+
+  </Package>
+</Wix>
