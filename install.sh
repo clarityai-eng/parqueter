@@ -77,6 +77,22 @@ case "$os" in
     tar xzf "$tmp/$asset" -C "$tmp"
     install -m 755 "$tmp/parqueter" "$BIN_DIR/parqueter"
     say "Installed $BIN_DIR/parqueter"
+
+    # Desktop entry and icon so the app shows its name and icon in the panel.
+    data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+    if [ -f "$tmp/parqueter.desktop" ]; then
+      mkdir -p "$data_dir/applications"
+      sed "s|^Exec=.*|Exec=$BIN_DIR/parqueter %f|" "$tmp/parqueter.desktop" \
+        > "$data_dir/applications/parqueter.desktop"
+      say "Installed $data_dir/applications/parqueter.desktop"
+    fi
+    if [ -f "$tmp/parqueter.svg" ]; then
+      mkdir -p "$data_dir/icons/hicolor/scalable/apps"
+      cp "$tmp/parqueter.svg" "$data_dir/icons/hicolor/scalable/apps/parqueter.svg"
+      say "Installed $data_dir/icons/hicolor/scalable/apps/parqueter.svg"
+    fi
+    command -v update-desktop-database >/dev/null 2>&1 \
+      && update-desktop-database "$data_dir/applications" 2>/dev/null || true
     ;;
   *)
     die "unsupported OS: $os (on Windows, download the .zip from https://github.com/$REPO/releases)"

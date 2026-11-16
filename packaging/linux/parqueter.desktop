@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Parqueter
+Comment=Parquet file viewer
+Exec=parqueter %f
+Icon=parqueter
+Terminal=false
+Type=Application
+Categories=Utility;Development;
+MimeType=application/vnd.apache.parquet;application/x-parquet;
+StartupWMClass=parqueter

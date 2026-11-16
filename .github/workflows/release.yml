@@ -65,8 +65,12 @@ jobs:
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz ${{ matrix.binary }}
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} staging/
+          if [ -d packaging/linux ]; then
+            cp packaging/linux/parqueter.desktop packaging/linux/parqueter.svg staging/ 2>/dev/null || true
+          fi
+          tar czf ${{ matrix.artifact }}.tar.gz -C staging .
 
       - name: Package .app bundle (macOS)
         if: runner.os == 'macOS'
