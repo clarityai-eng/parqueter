@@ -4,3 +4,6 @@
 /openspec/
 .claude/skills/openspec-*/
 .claude/commands/opsx/
+
+# IDEs
+.idea/
