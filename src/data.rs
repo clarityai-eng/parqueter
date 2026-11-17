@@ -70,6 +70,8 @@ pub struct LazyParquetSource {
     /// (chunk index, column index) -> decoded column values for that chunk.
     cache: RefCell<LruCache<(usize, usize), ArrayRef>>,
     cache_bytes: Cell<usize>,
+    /// Eviction threshold for `cache_bytes`. A field so tests can shrink it.
+    cache_budget: usize,
     /// Per column: an open reader positioned after the last chunk read.
     readers: RefCell<Vec<Option<ColumnReader>>>,
 }
@@ -120,6 +122,7 @@ impl LazyParquetSource {
             total_rows: global_start,
             cache: RefCell::new(LruCache::unbounded()),
             cache_bytes: Cell::new(0),
+            cache_budget: CACHE_BUDGET_BYTES,
             readers: RefCell::new((0..columns_len).map(|_| None).collect()),
         })
     }
@@ -219,7 +222,7 @@ impl LazyParquetSource {
         let mut bytes = self.cache_bytes.get() + array.get_array_memory_size();
         cache.put((chunk, col), array.clone());
         // Evict, but never the entry just inserted (it is most recent, so it goes last).
-        while bytes > CACHE_BUDGET_BYTES && cache.len() > 1 {
+        while bytes > self.cache_budget && cache.len() > 1 {
             if let Some((_, evicted)) = cache.pop_lru() {
                 bytes -= evicted.get_array_memory_size();
             }
@@ -397,17 +400,35 @@ mod tests {
         assert_eq!(w.finish(), "short");
     }
 
-    /// Rows must come back right across chunk and row-group boundaries, whatever
-    /// order they are read in (forward, backward, jumps) and with nulls and lists.
-    #[test]
-    fn reads_rows_across_chunks_and_row_groups() {
-        use arrow_array::builder::{ListBuilder, Float32Builder};
-        use arrow_array::{Int64Array, RecordBatch, StringArray};
+    /// A Parquet file in the temp dir, deleted on drop.
+    struct TempParquet(PathBuf);
+
+    impl Drop for TempParquet {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+        }
+    }
+
+    fn write_parquet(tag: &str, batch: &arrow_array::RecordBatch, max_row_group_rows: usize) -> TempParquet {
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::WriterProperties;
+
+        let path = std::env::temp_dir().join(format!("parqueter-test-{tag}-{}.parquet", std::process::id()));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(max_row_group_rows))
+            .build();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        TempParquet(path)
+    }
+
+    /// `rows` rows of: id (int64), name (string, null every 7th row), embedding (list<float>).
+    fn mixed_batch(rows: usize) -> arrow_array::RecordBatch {
+        use arrow_array::builder::{Float32Builder, ListBuilder};
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
         use std::sync::Arc;
 
-        let rows = 1500usize; // several 256-row chunks, three row groups
         let ids = Int64Array::from_iter_values(0..rows as i64);
         let names = StringArray::from_iter(
             (0..rows).map(|i| if i % 7 == 0 { None } else { Some(format!("name {i}")) }),
@@ -418,22 +439,35 @@ mod tests {
             lists.values().append_value(0.5);
             lists.append(true);
         }
-        let batch = RecordBatch::try_from_iter([
+        RecordBatch::try_from_iter([
             ("id", Arc::new(ids) as ArrayRef),
             ("name", Arc::new(names) as ArrayRef),
             ("embedding", Arc::new(lists.finish()) as ArrayRef),
         ])
-        .unwrap();
+        .unwrap()
+    }
 
-        let path = std::env::temp_dir().join(format!("parqueter-test-{}.parquet", std::process::id()));
-        let props = WriterProperties::builder().set_max_row_group_row_count(Some(600)).build();
-        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
+    /// Rows must come back right across chunk and row-group boundaries, whatever
+    /// order they are read in (forward, backward, jumps) and with nulls and lists.
+    #[test]
+    fn reads_rows_across_chunks_and_row_groups() {
+        let rows = 1500usize; // several 256-row chunks, three row groups
+        let file = write_parquet("rows", &mixed_batch(rows), 600);
 
-        let source = LazyParquetSource::open(&path).unwrap();
+        let source = LazyParquetSource::open(&file.0).unwrap();
         assert_eq!(source.row_count(), rows);
+        assert_eq!(source.col_count(), 3);
+        assert_eq!(source.column_name(2), "embedding");
+        assert_eq!(source.column_type(0), "Int64");
         assert!(source.chunks.iter().map(|c| c.row_group).max().unwrap() >= 2);
+        // No chunk crosses a row group, and chunks tile the file without gaps.
+        let mut next = 0;
+        for c in &source.chunks {
+            assert_eq!(c.global_start, next);
+            assert!(c.num_rows <= CHUNK_ROWS);
+            next += c.num_rows;
+        }
+        assert_eq!(next, rows);
 
         let order: Vec<usize> = (0..rows).step_by(37)
             .chain((0..rows).rev().step_by(53))
@@ -445,7 +479,130 @@ mod tests {
             assert_eq!(source.cell(row, 1), name, "name at row {row}");
             assert_eq!(source.cell_full(row, 2), format!("[{row}.0, 0.5]"), "embedding at row {row}");
         }
-        std::fs::remove_file(&path).ok();
+    }
+
+    /// Each order on a fresh source, so reads hit the disk instead of the cache and
+    /// the per-column reader must seek backwards and skip ahead correctly.
+    #[test]
+    fn reads_rows_in_any_order_from_disk() {
+        let rows = 1500usize;
+        let file = write_parquet("order", &mixed_batch(rows), 1500); // one row group, six chunks
+        let orders: [&[usize]; 4] = [
+            &[1499, 1200, 900, 600, 300, 0], // backwards
+            &[0, 1000, 300, 1499, 256],       // jumps
+            &[0, 256, 512, 1300, 768],        // forward, then skip ahead, then back
+            &[700, 300],                      // start in the middle
+        ];
+        for order in orders {
+            let source = LazyParquetSource::open(&file.0).unwrap();
+            for &row in order {
+                assert_eq!(source.cell(row, 0), row.to_string(), "id at row {row}, order {order:?}");
+                assert_eq!(source.cell_full(row, 2), format!("[{row}.0, 0.5]"), "embedding at row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn rows_past_the_end_are_empty() {
+        let file = write_parquet("past-end", &mixed_batch(10), 600);
+        let source = LazyParquetSource::open(&file.0).unwrap();
+        assert_eq!(source.cell(10, 0), "");
+        assert_eq!(source.cell_full(usize::MAX, 0), "");
+        assert!(!source.is_cached(10, 0));
+    }
+
+    #[test]
+    fn is_cached_tracks_loaded_chunks_per_column() {
+        let file = write_parquet("cached", &mixed_batch(600), 600);
+        let source = LazyParquetSource::open(&file.0).unwrap();
+        assert!(!source.is_cached(300, 0));
+        source.cell(300, 0);
+        // The whole 256-row chunk is loaded, only for that column.
+        assert!(source.is_cached(256, 0));
+        assert!(source.is_cached(511, 0));
+        assert!(!source.is_cached(255, 0));
+        assert!(!source.is_cached(512, 0));
+        assert!(!source.is_cached(300, 1));
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_beyond_budget() {
+        let file = write_parquet("evict", &mixed_batch(1024), 1024);
+        let mut source = LazyParquetSource::open(&file.0).unwrap();
+        source.cell(0, 0);
+        let chunk_bytes = source.cache_bytes.get();
+        assert!(chunk_bytes > 0);
+        // Room for two id chunks.
+        source.cache_budget = chunk_bytes * 2;
+
+        source.cell(256, 0);
+        source.cell(0, 0); // touch chunk 0, so chunk 1 is now least recent
+        source.cell(512, 0);
+        assert!(source.is_cached(0, 0));
+        assert!(!source.is_cached(256, 0), "least recently used chunk should be evicted");
+        assert!(source.is_cached(512, 0));
+        assert!(source.cache_bytes.get() <= source.cache_budget);
+
+        // A chunk larger than the whole budget is still kept, alone.
+        source.cache_budget = 1;
+        assert_eq!(source.cell(768, 0), "768");
+        assert!(source.is_cached(768, 0));
+        assert_eq!(source.cache.borrow().len(), 1);
+    }
+
+    #[test]
+    fn display_text_is_truncated_but_copy_text_is_not() {
+        use arrow_array::{RecordBatch, StringArray};
+        use std::sync::Arc;
+
+        let long = "x".repeat(DISPLAY_MAX_CHARS + 50);
+        let batch = RecordBatch::try_from_iter([(
+            "text",
+            Arc::new(StringArray::from(vec![long.as_str()])) as ArrayRef,
+        )])
+        .unwrap();
+        let file = write_parquet("truncate", &batch, 600);
+        let source = LazyParquetSource::open(&file.0).unwrap();
+
+        let shown = source.cell(0, 0);
+        assert_eq!(shown.chars().count(), DISPLAY_MAX_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        assert_eq!(source.cell_full(0, 0), long);
+    }
+
+    #[test]
+    fn column_widths_fit_content_within_limits() {
+        use arrow_array::{RecordBatch, StringArray};
+        use std::sync::Arc;
+
+        let batch = RecordBatch::try_from_iter([
+            ("a", Arc::new(StringArray::from(vec!["x"])) as ArrayRef),
+            ("b", Arc::new(StringArray::from(vec!["y".repeat(40)])) as ArrayRef),
+            ("c", Arc::new(StringArray::from(vec!["z".repeat(500)])) as ArrayRef),
+        ])
+        .unwrap();
+        let file = write_parquet("widths", &batch, 600);
+        let source = LazyParquetSource::open(&file.0).unwrap();
+        let widths = source.column_widths();
+
+        // "a": the header subtitle "#1  type: Utf8" is the widest text.
+        let subtitle = "#1  type: Utf8".len() as f32;
+        assert_eq!(widths[0], (subtitle * CHAR_WIDTH + COL_PADDING).max(MIN_COL_WIDTH));
+        assert_eq!(widths[1], 40.0 * CHAR_WIDTH + COL_PADDING);
+        assert_eq!(widths[2], MAX_COL_WIDTH);
+    }
+
+    #[test]
+    fn open_reports_readable_errors() {
+        let missing = std::env::temp_dir().join("parqueter-test-does-not-exist.parquet");
+        let err = LazyParquetSource::open(&missing).err().unwrap();
+        assert!(err.starts_with("File not found"), "{err}");
+
+        let not_parquet = std::env::temp_dir().join(format!("parqueter-test-text-{}.parquet", std::process::id()));
+        std::fs::write(&not_parquet, "hello").unwrap();
+        let err = LazyParquetSource::open(&not_parquet).err().unwrap();
+        std::fs::remove_file(&not_parquet).ok();
+        assert!(err.starts_with("Not a valid Parquet file"), "{err}");
     }
 
     /// Manual probe against a real file:
