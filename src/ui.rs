@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -8,18 +9,45 @@ use crate::data::DataSource;
 const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
 const HEADER_HEIGHT: f32 = 58.0;
-const FILE_HEADER_HEIGHT: f32 = 70.0; // approximate: pt_4 + text_xl + text_sm + pb_2 + border
 const SCROLL_STEP: f32 = 300.0;
 const SCROLLBAR_SIZE: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 20.0;
+/// Inset around the table so rounded window corners don't clip the scrollbars or cells.
+const TABLE_MARGIN: f32 = 10.0;
+
+const ROW_STEP: usize = 20;
+const PAGE_STEP: usize = 200;
 
 fn to_f32(p: Pixels) -> f32 {
     let v: f32 = p.into();
     v
 }
 
-const ROW_STEP: usize = 20;
-const PAGE_STEP: usize = 200;
+/// Scrollbar geometry along the scroll axis, in window coordinates.
+/// Written while painting, read by the mouse handlers.
+#[derive(Clone, Copy)]
+struct ThumbGeom {
+    track_origin: f32,
+    track_len: f32,
+    thumb_start: f32, // relative to track_origin
+    thumb_len: f32,
+}
+
+/// `visible` is the fraction of the content shown in the viewport,
+/// `position` how far it is scrolled (0 = start, 1 = end).
+fn thumb_geom(track_origin: f32, track_len: f32, visible: f32, position: f32) -> Option<ThumbGeom> {
+    if track_len <= 0.0 || visible >= 1.0 {
+        return None;
+    }
+    let thumb_len = (track_len * visible).max(SCROLLBAR_MIN_THUMB).min(track_len);
+    let thumb_start = position.clamp(0.0, 1.0) * (track_len - thumb_len);
+    Some(ThumbGeom {
+        track_origin,
+        track_len,
+        thumb_start,
+        thumb_len,
+    })
+}
 
 actions!(parqueter, [ScrollUp, ScrollDown, ScrollLeft, ScrollRight, PageUp, PageDown, CopyCell, OpenFile]);
 
@@ -50,92 +78,117 @@ enum DragTarget {
     Horizontal,
 }
 
-pub struct RootView {
-    state: AppState,
+/// Column geometry derived from a data source.
+struct ColumnLayout {
     row_num_width: f32,
     col_widths: Vec<f32>,
     col_positions: Vec<f32>,
     data_width: f32,
-    focus_handle: FocusHandle,
-    v_scroll_handle: UniformListScrollHandle,
-    scroll_row: usize,
-    h_offset: f32,
-    // Scrollbar drag state
-    dragging: Option<DragTarget>,
-    drag_start_pos: f32,       // mouse position when drag started
-    drag_start_offset: f32,    // scroll offset when drag started
-    drag_idle: bool,           // true when drag paused long enough to show data
-    drag_generation: usize,    // bumped on each mouse move, idle timer checks this
-    selected_cell: Option<(usize, usize)>, // (row, col)
-    toast: Option<String>,
-    toast_generation: usize,
-    // Cached layout dimensions (updated each render)
-    v_track_height: f32,
-    h_track_width: f32,
-    v_max_offset: f32,
-    h_max_offset: f32,
 }
 
-impl RootView {
-    pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
-        let (col_widths, row_num_width) = match &state {
-            AppState::Loaded { source, .. } => {
-                let widths = source.column_widths();
-                let digits = format!("{}", source.row_count()).len();
-                let w = (digits as f32 * 9.0 + 24.0).max(ROW_NUM_WIDTH);
-                (widths, w)
-            }
-            _ => (vec![], ROW_NUM_WIDTH),
+impl ColumnLayout {
+    fn new(source: Option<&dyn DataSource>) -> Self {
+        let Some(source) = source else {
+            return Self {
+                row_num_width: ROW_NUM_WIDTH,
+                col_widths: vec![],
+                col_positions: vec![],
+                data_width: 0.0,
+            };
         };
+        let col_widths = source.column_widths();
         let mut col_positions = Vec::with_capacity(col_widths.len());
         let mut acc = 0.0f32;
         for &w in &col_widths {
             col_positions.push(acc);
             acc += w;
         }
-        let data_width = acc;
+        let digits = source.row_count().to_string().len();
         Self {
-            state,
-            row_num_width,
+            row_num_width: (digits as f32 * 9.0 + 24.0).max(ROW_NUM_WIDTH),
             col_widths,
             col_positions,
-            data_width,
+            data_width: acc,
+        }
+    }
+}
+
+pub struct RootView {
+    state: AppState,
+    layout: ColumnLayout,
+    focus_handle: FocusHandle,
+    // Vertical position in pixels. f64 because f32 (GPUI's Pixels) loses whole
+    // pixels past ~16M px, i.e. ~600k rows, and small scroll deltas get dropped.
+    v_offset: f64,
+    h_offset: f32,
+    // Height of the row area, measured at the last paint
+    body_height: Rc<Cell<f32>>,
+    // Scrollbar drag state
+    dragging: Option<DragTarget>,
+    drag_start_pos: f32,    // mouse position when drag started
+    drag_start_offset: f64, // scroll offset when drag started
+    drag_scale: f64,        // scroll pixels per mouse pixel
+    drag_idle: bool,        // true when drag paused long enough to show data
+    drag_generation: usize, // bumped on each mouse move, idle timer checks this
+    selected_cell: Option<(usize, usize)>, // (row, col)
+    toast: Option<String>,
+    toast_generation: usize,
+    // Scrollbar geometry from the last paint
+    v_thumb: Rc<Cell<Option<ThumbGeom>>>,
+    h_thumb: Rc<Cell<Option<ThumbGeom>>>,
+    // Axis lock for trackpad gestures, so a vertical swipe doesn't drift sideways
+    scroll_gesture: OngoingScroll,
+    // Updated each render
+    h_max_offset: f32,
+}
+
+impl RootView {
+    pub fn new(state: AppState, cx: &mut Context<Self>) -> Self {
+        let layout = match &state {
+            AppState::Loaded { source, .. } => ColumnLayout::new(Some(source.as_ref())),
+            _ => ColumnLayout::new(None),
+        };
+        Self {
+            state,
+            layout,
             focus_handle: cx.focus_handle(),
-            v_scroll_handle: UniformListScrollHandle::new(),
-            scroll_row: 0,
+            v_offset: 0.0,
             h_offset: 0.0,
+            body_height: Rc::new(Cell::new(0.0)),
             dragging: None,
             drag_start_pos: 0.0,
             drag_start_offset: 0.0,
+            drag_scale: 1.0,
             drag_idle: false,
             drag_generation: 0,
             selected_cell: None,
             toast: None,
             toast_generation: 0,
-            v_track_height: 0.0,
-            h_track_width: 0.0,
-            v_max_offset: 0.0,
+            v_thumb: Rc::new(Cell::new(None)),
+            h_thumb: Rc::new(Cell::new(None)),
+            scroll_gesture: OngoingScroll::default(),
             h_max_offset: 0.0,
         }
     }
 
     fn visible_col_range(&self, viewport_width: f32) -> (usize, usize, f32) {
-        if self.col_positions.is_empty() {
+        let l = &self.layout;
+        if l.col_positions.is_empty() {
             return (0, 0, 0.0);
         }
         let left = self.h_offset;
         let right = self.h_offset + viewport_width;
 
-        let first = (0..self.col_widths.len())
-            .find(|&i| self.col_positions[i] + self.col_widths[i] > left)
+        let first = (0..l.col_widths.len())
+            .find(|&i| l.col_positions[i] + l.col_widths[i] > left)
             .unwrap_or(0);
 
-        let last = self
+        let last = l
             .col_positions
             .partition_point(|&pos| pos < right)
-            .min(self.col_widths.len());
+            .min(l.col_widths.len());
 
-        let spacer = self.col_positions[first] - left;
+        let spacer = l.col_positions[first] - left;
         (first, last, spacer)
     }
 
@@ -146,35 +199,102 @@ impl RootView {
         }
     }
 
-    fn scroll_up(&mut self, _: &ScrollUp, window: &mut Window, _cx: &mut Context<Self>) {
-        self.scroll_row = self.scroll_row.saturating_sub(ROW_STEP);
-        self.v_scroll_handle
-            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
-        window.refresh();
+    // -- Scrolling --
+
+    /// Max vertical offset. Leaves room below the last row for the horizontal
+    /// scrollbar so it never covers data.
+    fn v_max_offset(&self) -> f64 {
+        let bottom_pad = if self.h_max_offset > 0.0 { SCROLLBAR_SIZE } else { 0.0 };
+        let content = self.row_count() as f64 * ROW_HEIGHT as f64 + bottom_pad as f64;
+        (content - self.body_height.get() as f64).max(0.0)
     }
 
-    fn scroll_down(&mut self, _: &ScrollDown, window: &mut Window, _cx: &mut Context<Self>) {
-        let max = self.row_count().saturating_sub(1);
-        self.scroll_row = (self.scroll_row + ROW_STEP).min(max);
-        self.v_scroll_handle
-            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
-        window.refresh();
+    fn max_offset(&self, target: DragTarget) -> f64 {
+        match target {
+            DragTarget::Vertical => self.v_max_offset(),
+            DragTarget::Horizontal => self.h_max_offset as f64,
+        }
     }
 
-    fn page_up(&mut self, _: &PageUp, window: &mut Window, _cx: &mut Context<Self>) {
-        self.scroll_row = self.scroll_row.saturating_sub(PAGE_STEP);
-        self.v_scroll_handle
-            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
-        window.refresh();
+    fn scroll_offset(&self, target: DragTarget) -> f64 {
+        match target {
+            DragTarget::Vertical => self.v_offset,
+            DragTarget::Horizontal => self.h_offset as f64,
+        }
     }
 
-    fn page_down(&mut self, _: &PageDown, window: &mut Window, _cx: &mut Context<Self>) {
-        let max = self.row_count().saturating_sub(1);
-        self.scroll_row = (self.scroll_row + PAGE_STEP).min(max);
-        self.v_scroll_handle
-            .scroll_to_item(self.scroll_row, ScrollStrategy::Top);
-        window.refresh();
+    /// Clamps and applies the offset. Returns true when it changed.
+    fn set_scroll_offset(&mut self, target: DragTarget, offset: f64) -> bool {
+        let offset = offset.clamp(0.0, self.max_offset(target));
+        match target {
+            DragTarget::Vertical => {
+                let changed = offset != self.v_offset;
+                self.v_offset = offset;
+                changed
+            }
+            DragTarget::Horizontal => {
+                let offset = offset as f32;
+                let changed = offset != self.h_offset;
+                self.h_offset = offset;
+                changed
+            }
+        }
     }
+
+    fn scroll_by(&mut self, target: DragTarget, delta: f64, cx: &mut Context<Self>) {
+        let offset = self.scroll_offset(target) + delta;
+        if self.set_scroll_offset(target, offset) {
+            cx.notify();
+        }
+    }
+
+    fn scroll_up(&mut self, _: &ScrollUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(DragTarget::Vertical, -((ROW_STEP as f32 * ROW_HEIGHT) as f64), cx);
+    }
+
+    fn scroll_down(&mut self, _: &ScrollDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(DragTarget::Vertical, (ROW_STEP as f32 * ROW_HEIGHT) as f64, cx);
+    }
+
+    fn page_up(&mut self, _: &PageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(DragTarget::Vertical, -((PAGE_STEP as f32 * ROW_HEIGHT) as f64), cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(DragTarget::Vertical, (PAGE_STEP as f32 * ROW_HEIGHT) as f64, cx);
+    }
+
+    fn scroll_left(&mut self, _: &ScrollLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(DragTarget::Horizontal, -SCROLL_STEP as f64, cx);
+    }
+
+    fn scroll_right(&mut self, _: &ScrollRight, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(DragTarget::Horizontal, SCROLL_STEP as f64, cx);
+    }
+
+    /// Wheel / trackpad scrolling on both axes. Shift+wheel arrives as an X delta
+    /// on every platform.
+    fn on_table_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let mut delta = event.delta.pixel_delta(window.line_height());
+        if event.delta.precise() {
+            self.scroll_gesture.filter(&mut delta, event.touch_phase);
+        }
+        // Positive delta moves content right/down, i.e. scrolls towards the start.
+        let dx = -to_f32(delta.x) as f64;
+        let dy = -to_f32(delta.y) as f64;
+        let mut changed = false;
+        if dx != 0.0 {
+            changed |= self.set_scroll_offset(DragTarget::Horizontal, self.h_offset as f64 + dx);
+        }
+        if dy != 0.0 {
+            changed |= self.set_scroll_offset(DragTarget::Vertical, self.v_offset + dy);
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    // -- Toast, files, clipboard --
 
     const HEADER_ROW: usize = usize::MAX;
     const TOAST_DURATION_MS: u64 = 1500;
@@ -183,24 +303,20 @@ impl RootView {
         self.toast = Some(msg);
         self.toast_generation = self.toast_generation.wrapping_add(1);
         let generation = self.toast_generation;
-        cx.spawn_in(window, async move |_this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(RootView::TOAST_DURATION_MS))
                 .await;
-            cx.update(|window, cx| {
-                if let Some(entity) = _this.upgrade() {
-                    entity.update(cx, |view, _cx| {
-                        if view.toast_generation == generation {
-                            view.toast = None;
-                        }
-                    });
-                    window.refresh();
+            this.update(cx, |view, cx| {
+                if view.toast_generation == generation {
+                    view.toast = None;
+                    cx.notify();
                 }
             })
             .ok();
         })
         .detach();
-        window.refresh();
+        cx.notify();
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -210,19 +326,15 @@ impl RootView {
             multiple: false,
             prompt: Some("Open Parquet file".into()),
         });
-        cx.spawn_in(window, async move |_this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(path) = paths.into_iter().next() {
-                    cx.update(|window, app| {
-                        if let Some(entity) = _this.upgrade() {
-                            entity.update(app, |view, cx| {
-                                view.load_file(&path, window, cx);
-                            });
-                        }
-                    }).ok();
-                }
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update_in(cx, |view, window, cx| view.load_file(&path, window, cx))
+                    .ok();
             }
-        }).detach();
+        })
+        .detach();
     }
 
     pub(crate) fn load_file(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -236,28 +348,16 @@ impl RootView {
         match LazyParquetSource::open(path) {
             Ok(source) => {
                 let source: Rc<dyn DataSource> = Rc::new(source);
-                let col_widths = source.column_widths();
-                let mut col_positions = Vec::with_capacity(col_widths.len());
-                let mut acc = 0.0f32;
-                for &w in &col_widths {
-                    col_positions.push(acc);
-                    acc += w;
-                }
-                let digits = format!("{}", source.row_count()).len();
-                self.row_num_width = (digits as f32 * 9.0 + 24.0).max(ROW_NUM_WIDTH);
-                self.data_width = acc;
-                self.col_widths = col_widths;
-                self.col_positions = col_positions;
+                self.layout = ColumnLayout::new(Some(source.as_ref()));
                 self.state = AppState::Loaded { file_name, source };
-                self.scroll_row = 0;
+                self.v_offset = 0.0;
                 self.h_offset = 0.0;
                 self.selected_cell = None;
-                self.v_scroll_handle = UniformListScrollHandle::new();
                 self.show_toast(format!("Opened: {}", path.display()), window, cx);
             }
             Err(e) => {
                 self.state = AppState::Error(e);
-                window.refresh();
+                cx.notify();
             }
         }
     }
@@ -273,17 +373,20 @@ impl RootView {
         }
     }
 
+    fn copy_to_clipboard(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.cell_text_for_selection(row, col) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        let preview = if text.chars().count() > 40 {
+            format!("\"{}...\" copied", text.chars().take(37).collect::<String>())
+        } else {
+            format!("\"{text}\" copied")
+        };
+        self.show_toast(preview, window, cx);
+    }
+
     fn copy_cell(&mut self, _: &CopyCell, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((row, col)) = self.selected_cell {
-            if let Some(text) = self.cell_text_for_selection(row, col) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                let preview = if text.chars().count() > 40 {
-                    format!("\"{}...\" copied", text.chars().take(37).collect::<String>())
-                } else {
-                    format!("\"{text}\" copied")
-                };
-                self.show_toast(preview, window, cx);
-            }
+            self.copy_to_clipboard(row, col, window, cx);
         }
     }
 
@@ -297,193 +400,89 @@ impl RootView {
     ) {
         self.selected_cell = Some((row, col));
         if click_count >= 2 {
-            if let Some(text) = self.cell_text_for_selection(row, col) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                let preview = if text.chars().count() > 40 {
-                    format!("\"{}...\" copied", text.chars().take(37).collect::<String>())
-                } else {
-                    format!("\"{text}\" copied")
-                };
-                self.show_toast(preview, window, cx);
-            }
+            self.copy_to_clipboard(row, col, window, cx);
         }
-        window.refresh();
-    }
-
-    fn scroll_left(&mut self, _: &ScrollLeft, window: &mut Window, _cx: &mut Context<Self>) {
-        self.h_offset = (self.h_offset - SCROLL_STEP).max(0.0);
-        window.refresh();
-    }
-
-    fn scroll_right(&mut self, _: &ScrollRight, window: &mut Window, _cx: &mut Context<Self>) {
-        self.h_offset = (self.h_offset + SCROLL_STEP).min(self.h_max_offset);
-        window.refresh();
-    }
-
-    // -- Scrollbar metrics --
-
-    fn v_scroll_metrics(&self, track_height: f32) -> Option<(f32, f32, f32)> {
-        // Use cached v_max_offset (from last full render) as the authoritative max,
-        // because during deferred drag the live max_offset may be stale/zero.
-        let max_off = if self.v_max_offset > 0.0 {
-            self.v_max_offset
-        } else {
-            let state = self.v_scroll_handle.0.borrow();
-            let live: f32 = state.base_handle.max_offset().y.into();
-            live
-        };
-        if max_off <= 0.0 {
-            return None;
-        }
-        let state = self.v_scroll_handle.0.borrow();
-        let cur_off: f32 = (-state.base_handle.offset().y).into();
-        let ratio = (cur_off / max_off).clamp(0.0, 1.0);
-        let content_h = track_height + max_off;
-        let thumb_h = (track_height / content_h * track_height).max(SCROLLBAR_MIN_THUMB);
-        let thumb_top = ratio * (track_height - thumb_h);
-        Some((thumb_h, thumb_top, max_off))
-    }
-
-    fn h_scroll_metrics(&self, track_width: f32) -> Option<(f32, f32)> {
-        if self.h_max_offset <= 0.0 {
-            return None;
-        }
-        let ratio = self.h_offset / self.h_max_offset;
-        let thumb_w = (track_width / self.data_width * track_width).max(SCROLLBAR_MIN_THUMB);
-        let thumb_left = ratio * (track_width - thumb_w);
-        Some((thumb_w, thumb_left))
+        cx.notify();
     }
 
     // -- Scrollbar drag handlers --
 
-    fn on_v_track_click(
+    fn on_scrollbar_mouse_down(
         &mut self,
+        target: DragTarget,
         event: &MouseDownEvent,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        if self.v_track_height <= 0.0 || self.v_max_offset <= 0.0 {
-            return;
-        }
-        // Jump: map click Y to scroll offset via set_offset
-        let file_header_h = to_f32(window.viewport_size().height) - self.v_track_height - HEADER_HEIGHT;
-        let click_in_track = to_f32(event.position.y) - file_header_h - HEADER_HEIGHT;
-        let ratio = (click_in_track / self.v_track_height).clamp(0.0, 1.0);
-        let new_offset = ratio * self.v_max_offset;
-        {
-            let state = self.v_scroll_handle.0.borrow();
-            state.base_handle.set_offset(point(state.base_handle.offset().x, px(-new_offset)));
-        }
-
-        // Start drag
-        self.dragging = Some(DragTarget::Vertical);
-        self.drag_start_pos = to_f32(event.position.y);
-        self.drag_start_offset = new_offset;
-        window.refresh();
-    }
-
-    fn on_h_track_click(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        if self.h_track_width <= 0.0 {
-            return;
-        }
-        // Jump: map click X to h_offset
-        let click_in_track = to_f32(event.position.x) - self.row_num_width;
-        let ratio = (click_in_track / self.h_track_width).clamp(0.0, 1.0);
-        self.h_offset = (ratio * self.h_max_offset).min(self.h_max_offset);
-
-        // Start drag
-        self.dragging = Some(DragTarget::Horizontal);
-        self.drag_start_pos = to_f32(event.position.x);
-        self.drag_start_offset = self.h_offset;
-        window.refresh();
-    }
-
-    fn on_global_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self.dragging else { return };
-        match target {
-            DragTarget::Vertical => {
-                if self.v_track_height <= 0.0 || self.v_max_offset <= 0.0 {
-                    return;
-                }
-                let delta_px = to_f32(event.position.y) - self.drag_start_pos;
-                let scale = self.v_max_offset / self.v_track_height;
-                let new_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.v_max_offset);
-                {
-                    let state = self.v_scroll_handle.0.borrow();
-                    state.base_handle.set_offset(point(state.base_handle.offset().x, px(-new_offset)));
-                }
-                // Movement detected: reset idle, bump generation, schedule idle check
-                self.drag_idle = false;
-                self.drag_generation = self.drag_generation.wrapping_add(1);
-                let generation = self.drag_generation;
-                cx.spawn_in(window, async move |_this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(100)).await;
-                    cx.update(|window, cx| {
-                        if let Some(entity) = _this.upgrade() {
-                            entity.update(cx, |view, _cx| {
-                                if view.dragging == Some(DragTarget::Vertical)
-                                    && view.drag_generation == generation
-                                {
-                                    view.drag_idle = true;
-                                }
-                            });
-                            window.refresh();
-                        }
-                    }).ok();
-                }).detach();
-                window.refresh();
-            }
-            DragTarget::Horizontal => {
-                if self.h_track_width <= 0.0 {
-                    return;
-                }
-                let delta_px = to_f32(event.position.x) - self.drag_start_pos;
-                let scale = self.h_max_offset / self.h_track_width;
-                self.h_offset = (self.drag_start_offset + delta_px * scale).clamp(0.0, self.h_max_offset);
-                // Same idle pattern as vertical
-                self.drag_idle = false;
-                self.drag_generation = self.drag_generation.wrapping_add(1);
-                let generation = self.drag_generation;
-                cx.spawn_in(window, async move |_this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(100)).await;
-                    cx.update(|window, cx| {
-                        if let Some(entity) = _this.upgrade() {
-                            entity.update(cx, |view, _cx| {
-                                if view.dragging == Some(DragTarget::Horizontal)
-                                    && view.drag_generation == generation
-                                {
-                                    view.drag_idle = true;
-                                }
-                            });
-                            window.refresh();
-                        }
-                    }).ok();
-                }).detach();
-                window.refresh();
-            }
+        let geom = match target {
+            DragTarget::Vertical => self.v_thumb.get(),
+            DragTarget::Horizontal => self.h_thumb.get(),
+        };
+        let Some(g) = geom else { return };
+        let max = self.max_offset(target);
+        let travel = g.track_len - g.thumb_len;
+        if max <= 0.0 || travel <= 0.0 {
+            return;
         }
+        let pos = match target {
+            DragTarget::Vertical => to_f32(event.position.y),
+            DragTarget::Horizontal => to_f32(event.position.x),
+        };
+        let in_track = pos - g.track_origin;
+        // Clicking the track (not the thumb) centers the thumb on the click,
+        // then the drag continues from there.
+        if in_track < g.thumb_start || in_track > g.thumb_start + g.thumb_len {
+            let ratio = ((in_track - g.thumb_len / 2.0) / travel).clamp(0.0, 1.0);
+            self.set_scroll_offset(target, ratio as f64 * max);
+        }
+        self.dragging = Some(target);
+        self.drag_start_pos = pos;
+        self.drag_start_offset = self.scroll_offset(target);
+        self.drag_scale = max / travel as f64; // thumb follows the cursor 1:1
+        self.drag_idle = false;
+        cx.notify();
     }
 
-    fn on_global_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    /// Called from a window-level listener, so it keeps firing when the cursor
+    /// leaves the window during a drag.
+    fn on_drag_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.dragging else { return };
+        // Button no longer held: the release happened somewhere we didn't see
+        // (e.g. focus moved to another app). End the drag instead of sticking.
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_drag(cx);
+            return;
+        }
+        let pos = match target {
+            DragTarget::Vertical => to_f32(event.position.y),
+            DragTarget::Horizontal => to_f32(event.position.x),
+        };
+        let offset = self.drag_start_offset + (pos - self.drag_start_pos) as f64 * self.drag_scale;
+        self.set_scroll_offset(target, offset);
+
+        // Movement detected: reset idle, bump generation, schedule idle check
+        self.drag_idle = false;
+        self.drag_generation = self.drag_generation.wrapping_add(1);
+        let generation = self.drag_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(100)).await;
+            this.update(cx, |view, cx| {
+                if view.dragging.is_some() && view.drag_generation == generation {
+                    view.drag_idle = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
         if self.dragging.is_some() {
             self.dragging = None;
             self.drag_idle = false;
-            window.refresh();
+            cx.notify();
         }
     }
 }
@@ -535,12 +534,34 @@ impl Render for RootView {
             }
 
             AppState::Loaded { file_name, source } => {
+                let source = Rc::clone(source);
+                let file_name = file_name.clone();
                 let col_count = source.col_count();
                 let row_count = source.row_count();
-                let row_num_w = self.row_num_width;
-                let viewport_w: f32 = (window.viewport_size().width - px(row_num_w)).into();
+                let row_num_w = self.layout.row_num_width;
+
+                // -- Horizontal geometry --
+                let window_w = to_f32(window.viewport_size().width);
+                let viewport_w = (window_w - 2.0 * TABLE_MARGIN - row_num_w).max(0.0);
+                // Extra SCROLLBAR_SIZE so the last column can scroll clear of the vertical scrollbar.
+                self.h_max_offset = (self.layout.data_width + SCROLLBAR_SIZE - viewport_w).max(0.0);
+                self.h_offset = self.h_offset.min(self.h_max_offset); // window may have grown
+                let h_scrollable = self.h_max_offset > 0.0;
                 let (vis_first, vis_last, spacer) = self.visible_col_range(viewport_w);
-                let vis_widths: Vec<f32> = self.col_widths[vis_first..vis_last].to_vec();
+                let vis_widths: Vec<f32> = self.layout.col_widths[vis_first..vis_last].to_vec();
+
+                // -- Vertical geometry --
+                // Rows are virtualized by hand instead of with uniform_list, whose
+                // f32 offset breaks down on files with millions of rows.
+                let v_max = self.v_max_offset();
+                self.v_offset = self.v_offset.min(v_max); // window may have grown
+                let row_h = ROW_HEIGHT as f64;
+                let first_row = ((self.v_offset / row_h) as usize).min(row_count);
+                let row_shift = (self.v_offset - first_row as f64 * row_h) as f32;
+                // The window height always covers the row area, even before it's measured.
+                let rows_to_draw =
+                    (to_f32(window.viewport_size().height) / ROW_HEIGHT).ceil() as usize + 2;
+                let last_row = (first_row + rows_to_draw).min(row_count);
 
                 // File info header
                 let file_header = div()
@@ -553,7 +574,7 @@ impl Render for RootView {
                         div()
                             .text_xl()
                             .text_color(rgb(0x89b4fa))
-                            .child(file_name.clone()),
+                            .child(file_name),
                     )
                     .child(
                         div()
@@ -565,15 +586,16 @@ impl Render for RootView {
                 // -- Column header row --
                 let header_bg = rgb(0x313244);
                 let header_selected_bg = rgb(0x585b70);
-                let header_view = cx.entity().downgrade();
+                let view_entity = cx.entity().downgrade();
                 let mut header_data = div().flex().ml(px(spacer));
                 for (i, col) in (vis_first..vis_last).enumerate() {
                     let is_selected = self.selected_cell == Some((Self::HEADER_ROW, col));
                     let bg = if is_selected { header_selected_bg } else { header_bg };
-                    let view = header_view.clone();
+                    let view = view_entity.clone();
                     header_data = header_data.child(
                         div()
                             .id(ElementId::NamedInteger("hdr".into(), col as u64))
+                            .flex_shrink_0()
                             .w(px(vis_widths[i]))
                             .h(px(HEADER_HEIGHT))
                             .px_2()
@@ -585,12 +607,11 @@ impl Render for RootView {
                             .overflow_hidden()
                             .cursor_pointer()
                             .on_click(move |event: &ClickEvent, window, cx| {
-                                if let Some(entity) = view.upgrade() {
-                                    let count = event.click_count();
-                                    entity.update(cx, |this, cx| {
-                                        this.select_and_maybe_copy(RootView::HEADER_ROW, col, count, window, cx);
-                                    });
-                                }
+                                let count = event.click_count();
+                                view.update(cx, |this, cx| {
+                                    this.select_and_maybe_copy(RootView::HEADER_ROW, col, count, window, cx);
+                                })
+                                .ok();
                             })
                             .child(
                                 div()
@@ -614,9 +635,11 @@ impl Render for RootView {
 
                 let header_row = div()
                     .flex()
+                    .flex_shrink_0()
                     .h(px(HEADER_HEIGHT))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .w(px(row_num_w))
                             .h(px(HEADER_HEIGHT))
                             .px_2()
@@ -630,6 +653,7 @@ impl Render for RootView {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .w(px(viewport_w))
                             .h(px(HEADER_HEIGHT))
                             .overflow_hidden()
@@ -637,173 +661,220 @@ impl Render for RootView {
                     );
 
                 // -- Data rows --
-                let source_ref = Rc::clone(source);
-                let widths = vis_widths;
                 let dragging_fast = self.dragging.is_some() && !self.drag_idle;
-                let selected = self.selected_cell;
-                let view_entity = cx.entity().downgrade();
-                let data_rows = uniform_list(
-                    "data-rows",
-                    row_count,
-                    move |range, _window, _cx| {
-                        range
-                            .map(|row_idx| {
-                                let bg = if row_idx % 2 == 0 {
-                                    rgb(0x1e1e2e)
-                                } else {
-                                    rgb(0x181825)
-                                };
+                let mut rows = div().absolute().top(px(-row_shift)).left_0().flex().flex_col();
+                for row_idx in first_row..last_row {
+                    let bg = if row_idx % 2 == 0 {
+                        rgb(0x1e1e2e)
+                    } else {
+                        rgb(0x181825)
+                    };
 
-                                let mut data_cells = div().flex().ml(px(spacer));
-                                // During drag: show data if cached (free), empty if not (skip I/O)
-                                for (i, col_idx) in (vis_first..vis_last).enumerate() {
-                                    let show_data =
-                                        !dragging_fast || source_ref.is_cached(row_idx, col_idx);
-                                    let is_selected = selected == Some((row_idx, col_idx));
-                                    let cell_bg = if is_selected {
-                                        rgb(0x45475a)
-                                    } else {
-                                        bg
-                                    };
-                                    let mut cell = div()
-                                        .id(ElementId::NamedInteger("cell".into(), (row_idx * 10000 + col_idx) as u64))
-                                        .w(px(widths[i]))
-                                        .h(px(ROW_HEIGHT))
-                                        .border_r_1()
-                                        .border_color(rgb(0x45475a))
-                                        .bg(cell_bg)
-                                        .cursor_pointer();
-                                    if show_data {
-                                        let view = view_entity.clone();
-                                        cell = cell
-                                            .on_click(move |event: &ClickEvent, window, cx| {
-                                                if let Some(entity) = view.upgrade() {
-                                                    let count = event.click_count();
-                                                    entity.update(cx, |this, cx| {
-                                                        this.select_and_maybe_copy(row_idx, col_idx, count, window, cx);
-                                                    });
-                                                }
-                                            })
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .overflow_hidden()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0xcdd6f4))
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .child(
-                                                        source_ref.cell(row_idx, col_idx),
-                                                    ),
-                                            );
-                                    }
-                                    data_cells = data_cells.child(cell);
-                                }
+                    let mut data_cells = div().flex().ml(px(spacer));
+                    for (i, col_idx) in (vis_first..vis_last).enumerate() {
+                        // During drag: show data if cached (free), empty if not (skip I/O)
+                        let show_data = !dragging_fast || source.is_cached(row_idx, col_idx);
+                        let is_selected = self.selected_cell == Some((row_idx, col_idx));
+                        let cell_bg = if is_selected { rgb(0x45475a) } else { bg };
+                        let mut cell = div()
+                            // Scoped under the row's id, so no collisions however many columns.
+                            .id(col_idx)
+                            // Fixed width: without this, flex shrinks the cells to fit
+                            // the clipped row, and how much depends on h_offset.
+                            .flex_shrink_0()
+                            .w(px(vis_widths[i]))
+                            .h(px(ROW_HEIGHT))
+                            .border_r_1()
+                            .border_color(rgb(0x45475a))
+                            .bg(cell_bg)
+                            .cursor_pointer();
+                        if show_data {
+                            let view = view_entity.clone();
+                            cell = cell
+                                .on_click(move |event: &ClickEvent, window, cx| {
+                                    let count = event.click_count();
+                                    view.update(cx, |this, cx| {
+                                        this.select_and_maybe_copy(row_idx, col_idx, count, window, cx);
+                                    })
+                                    .ok();
+                                })
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xcdd6f4))
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(source.cell(row_idx, col_idx)),
+                                );
+                        }
+                        data_cells = data_cells.child(cell);
+                    }
 
+                    rows = rows.child(
+                        div()
+                            .id(row_idx)
+                            .flex()
+                            .h(px(ROW_HEIGHT))
+                            .bg(bg)
+                            .child(
                                 div()
-                                    .flex()
+                                    .flex_shrink_0()
+                                    .w(px(row_num_w))
                                     .h(px(ROW_HEIGHT))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .border_r_1()
+                                    .border_color(rgb(0x45475a))
                                     .bg(bg)
                                     .child(
                                         div()
-                                            .w(px(row_num_w))
-                                            .h(px(ROW_HEIGHT))
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .border_r_1()
-                                            .border_color(rgb(0x45475a))
-                                            .bg(bg)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(0x585b70))
-                                                    .child(format!("{}", row_idx + 1)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(viewport_w))
-                                            .h(px(ROW_HEIGHT))
-                                            .overflow_hidden()
-                                            .child(data_cells),
-                                    )
-                            })
-                            .collect()
-                    },
-                )
-                .flex_1()
-                .track_scroll(&self.v_scroll_handle);
-
-                // -- Compute layout dimensions for scrollbars --
-                // Scrollbar track = window height - file header - column header row
-                let window_h: f32 = window.viewport_size().height.into();
-                let body_h = (window_h - FILE_HEADER_HEIGHT - HEADER_HEIGHT).max(0.0);
-                self.v_track_height = body_h;
-                self.h_track_width = viewport_w;
-                self.h_max_offset = (self.data_width - viewport_w).max(0.0);
-
-                // Cache v_max_offset for drag handler
-                {
-                    let state = self.v_scroll_handle.0.borrow();
-                    let live_max: f32 = state.base_handle.max_offset().y.into();
-                    if live_max > 0.0 {
-                        self.v_max_offset = live_max;
-                    }
+                                            .text_xs()
+                                            .text_color(rgb(0x585b70))
+                                            .child((row_idx + 1).to_string()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w(px(viewport_w))
+                                    .h(px(ROW_HEIGHT))
+                                    .overflow_hidden()
+                                    .child(data_cells),
+                            ),
+                    );
                 }
 
-                // -- Scrollbars --
-                let v_scrollbar = self.v_scroll_metrics(body_h).map(|(thumb_h, thumb_top, _)| {
-                    div()
-                        .id("v-scrollbar-track")
-                        .absolute()
-                        .right_0()
-                        .top(px(HEADER_HEIGHT))
-                        .w(px(SCROLLBAR_SIZE))
-                        .h(px(body_h))
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(Self::on_v_track_click),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(thumb_top))
-                                .w(px(SCROLLBAR_SIZE))
-                                .h(px(thumb_h))
-                                .rounded(px(SCROLLBAR_SIZE / 2.0))
-                                .bg(rgb(0x585b70))
-                                .cursor_pointer(),
-                        )
-                });
+                // Measure the row area; re-render if it changed (first frame, resize).
+                let body_height = self.body_height.clone();
+                let measure_view = view_entity.clone();
+                let measure = canvas(
+                    move |bounds, _, cx| {
+                        let h = to_f32(bounds.size.height);
+                        if body_height.get() != h {
+                            body_height.set(h);
+                            cx.defer(move |cx| {
+                                measure_view.update(cx, |_, cx| cx.notify()).ok();
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full();
 
-                let h_scrollbar = self.h_scroll_metrics(viewport_w).map(|(thumb_w, thumb_left)| {
+                let data_area = div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(rows)
+                    .child(measure);
+
+                // -- Scrollbars --
+                // Tracks are sized by layout; the thumb is painted from the track's
+                // actual bounds, which are also stored for the mouse handlers.
+                let thumb_color = |active: bool| if active { rgb(0x7f849c) } else { rgb(0x585b70) };
+
+                let body_h = self.body_height.get() as f64;
+                let v_visible = if v_max > 0.0 { (body_h / (body_h + v_max)) as f32 } else { 1.0 };
+                let v_position = if v_max > 0.0 { (self.v_offset / v_max) as f32 } else { 0.0 };
+                let v_thumb = self.v_thumb.clone();
+                let v_color = thumb_color(self.dragging == Some(DragTarget::Vertical));
+                let v_scrollbar = div()
+                    .id("v-scrollbar-track")
+                    .absolute()
+                    .right_0()
+                    .top(px(HEADER_HEIGHT))
+                    .bottom(px(if h_scrollable { SCROLLBAR_SIZE } else { 0.0 }))
+                    .w(px(SCROLLBAR_SIZE))
+                    .block_mouse_except_scroll() // don't click the cells underneath
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e, w, cx| {
+                            this.on_scrollbar_mouse_down(DragTarget::Vertical, e, w, cx)
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let geom = thumb_geom(
+                                    to_f32(bounds.origin.y),
+                                    to_f32(bounds.size.height),
+                                    v_visible,
+                                    v_position,
+                                );
+                                v_thumb.set(geom);
+                                if let Some(g) = geom {
+                                    let thumb = Bounds::new(
+                                        point(bounds.origin.x, px(g.track_origin + g.thumb_start)),
+                                        size(bounds.size.width, px(g.thumb_len)),
+                                    );
+                                    window.paint_quad(
+                                        fill(thumb, v_color).corner_radii(px(SCROLLBAR_SIZE / 2.0)),
+                                    );
+                                }
+                            },
+                        )
+                        .size_full(),
+                    );
+
+                let h_scrollbar = h_scrollable.then(|| {
+                    let h_thumb = self.h_thumb.clone();
+                    let data_w = self.layout.data_width + SCROLLBAR_SIZE;
+                    let h_visible = viewport_w / data_w;
+                    let h_position = self.h_offset / self.h_max_offset;
+                    let h_color = thumb_color(self.dragging == Some(DragTarget::Horizontal));
                     div()
                         .id("h-scrollbar-track")
                         .absolute()
                         .bottom_0()
                         .left(px(row_num_w))
-                        .w(px(viewport_w))
+                        .w(px((viewport_w - SCROLLBAR_SIZE).max(0.0)))
                         .h(px(SCROLLBAR_SIZE))
+                        .block_mouse_except_scroll()
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(Self::on_h_track_click),
+                            cx.listener(|this, e, w, cx| {
+                                this.on_scrollbar_mouse_down(DragTarget::Horizontal, e, w, cx)
+                            }),
                         )
                         .child(
-                            div()
-                                .absolute()
-                                .left(px(thumb_left))
-                                .w(px(thumb_w))
-                                .h(px(SCROLLBAR_SIZE))
-                                .rounded(px(SCROLLBAR_SIZE / 2.0))
-                                .bg(rgb(0x585b70))
-                                .cursor_pointer(),
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    let geom = thumb_geom(
+                                        to_f32(bounds.origin.x),
+                                        to_f32(bounds.size.width),
+                                        h_visible,
+                                        h_position,
+                                    );
+                                    h_thumb.set(geom);
+                                    if let Some(g) = geom {
+                                        let thumb = Bounds::new(
+                                            point(px(g.track_origin + g.thumb_start), bounds.origin.y),
+                                            size(px(g.thumb_len), bounds.size.height),
+                                        );
+                                        window.paint_quad(
+                                            fill(thumb, h_color)
+                                                .corner_radii(px(SCROLLBAR_SIZE / 2.0)),
+                                        );
+                                    }
+                                },
+                            )
+                            .size_full(),
                         )
                 });
+                if !h_scrollable {
+                    self.h_thumb.set(None);
+                }
 
                 let body = div()
                     .flex()
@@ -811,19 +882,21 @@ impl Render for RootView {
                     .flex_1()
                     .min_h_0()
                     .child(header_row)
-                    .child(data_rows);
+                    .child(data_area);
 
                 let mut table_area = div()
+                    .id("table-area")
                     .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(body);
+                    .mx(px(TABLE_MARGIN))
+                    .mb(px(TABLE_MARGIN))
+                    .on_scroll(cx.listener(Self::on_table_scroll))
+                    .child(body)
+                    .child(v_scrollbar);
 
-                if let Some(bar) = v_scrollbar {
-                    table_area = table_area.child(bar);
-                }
                 if let Some(bar) = h_scrollbar {
                     table_area = table_area.child(bar);
                 }
@@ -850,11 +923,38 @@ impl Render for RootView {
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::open_file))
-            .on_mouse_move(cx.listener(Self::on_global_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_global_mouse_up))
             .size_full()
             .bg(rgb(0x1e1e2e))
             .child(content);
+
+        // While dragging a scrollbar, listen at window level instead of on an element:
+        // element handlers only fire while the cursor is over them, so a release outside
+        // the window was missed and the drag got stuck. The OS keeps delivering move/up
+        // events to the window during a drag (mouse capture on Windows, implicit grab on
+        // X11/Wayland, Cocoa on macOS).
+        if self.dragging.is_some() {
+            let view = cx.entity().downgrade();
+            root = root.child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let move_view = view.clone();
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Bubble {
+                                move_view.update(cx, |this, cx| this.on_drag_move(e, window, cx)).ok();
+                            }
+                        });
+                        window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
+                            if phase == DispatchPhase::Bubble && e.button == MouseButton::Left {
+                                view.update(cx, |this, cx| this.end_drag(cx)).ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+        }
 
         // Toast notification overlay
         if let Some(msg) = &self.toast {
