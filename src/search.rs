@@ -125,21 +125,8 @@ fn is_searchable(dt: &DataType) -> bool {
         dt,
         DataType::Utf8
             | DataType::LargeUtf8
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
             | DataType::Dictionary(_, _)
-    )
+    ) || is_castable_to_string(dt)
 }
 
 /// Search column header names.
@@ -270,14 +257,15 @@ fn search_column(
                 _ => {}
             }
         }
-        dt if is_numeric(dt) => {
-            match_numeric(col, searcher, row_offset, full_col_idx, hits);
+        dt if is_castable_to_string(dt) => {
+            match_castable(col, searcher, row_offset, full_col_idx, hits);
         }
         _ => {}
     }
 }
 
-fn is_numeric(dt: &DataType) -> bool {
+/// Types that can be cast to Utf8 for text search: numerics, booleans, dates, times.
+fn is_castable_to_string(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Int8
@@ -293,6 +281,13 @@ fn is_numeric(dt: &DataType) -> bool {
             | DataType::Float64
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
+            | DataType::Boolean
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
     )
 }
 
@@ -445,8 +440,9 @@ fn match_dictionary<K: arrow::datatypes::ArrowDictionaryKeyType>(
     }
 }
 
-/// Cast numeric columns to Utf8, then apply the same SIMD string scan.
-fn match_numeric(
+/// Cast non-string columns (numerics, booleans, dates, times) to Utf8,
+/// then apply the same SIMD string scan.
+fn match_castable(
     col: &dyn Array,
     searcher: &AhoCorasick,
     row_offset: usize,
@@ -585,7 +581,7 @@ mod tests {
             .build(["23"])
             .unwrap();
         let mut hits = Vec::new();
-        match_numeric(arr.as_ref(), &searcher, 0, 0, &mut hits);
+        match_castable(arr.as_ref(), &searcher, 0, 0, &mut hits);
         // "23" matches in "123" and "1234"
         assert_eq!(hits, vec![(0, 0), (2, 0)]);
     }
@@ -598,8 +594,28 @@ mod tests {
             .build(["3.14"])
             .unwrap();
         let mut hits = Vec::new();
-        match_numeric(arr.as_ref(), &searcher, 0, 0, &mut hits);
+        match_castable(arr.as_ref(), &searcher, 0, 0, &mut hits);
         assert_eq!(hits, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn boolean_search() {
+        let arr: Arc<dyn Array> = Arc::new(arrow::array::BooleanArray::from(vec![true, false, true, false]));
+        let searcher = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(["true"])
+            .unwrap();
+        let mut hits = Vec::new();
+        match_castable(arr.as_ref(), &searcher, 0, 0, &mut hits);
+        assert_eq!(hits, vec![(0, 0), (2, 0)]);
+
+        let mut hits = Vec::new();
+        let searcher = AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(["false"])
+            .unwrap();
+        match_castable(arr.as_ref(), &searcher, 0, 0, &mut hits);
+        assert_eq!(hits, vec![(1, 0), (3, 0)]);
     }
 
     #[test]
