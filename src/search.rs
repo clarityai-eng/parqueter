@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn float_search() {
-        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![3.14159, 2.71828, 1.0]));
+        let arr: Arc<dyn Array> = Arc::new(Float64Array::from(vec![std::f64::consts::PI, std::f64::consts::E, 1.0]));
         let searcher = AhoCorasick::builder()
             .ascii_case_insensitive(true)
             .build(["3.14"])

@@ -12,7 +12,6 @@ arrow-select = "60.1.0"
 arrow = { version = "60.1.0", features = ["prettyprint"] }
 lru = "0.14"
 rayon = "1"
-memchr = "2"
 aho-corasick = "1"
 bytes = "1"
 futures = "0.3"
