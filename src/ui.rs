@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -123,7 +124,11 @@ actions!(
         FirstRow,
         LastRow,
         CopyCell,
-        OpenFile
+        OpenFile,
+        ToggleSearch,
+        DismissSearch,
+        SearchNext,
+        SearchPrev,
     ]
 );
 
@@ -160,6 +165,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         // Kept on macOS too, for muscle memory from earlier versions.
         KeyBinding::new("ctrl-c", CopyCell, None),
         KeyBinding::new("ctrl-o", OpenFile, None),
+        KeyBinding::new(secondary!("f"), ToggleSearch, None),
+        KeyBinding::new("ctrl-f", ToggleSearch, None),
+        KeyBinding::new("escape", DismissSearch, None),
     ]
 }
 
@@ -260,6 +268,13 @@ pub struct RootView {
     // Updated each render
     h_max_offset: f32,
     viewport_w: f32, // width of the data columns area, excluding row numbers
+    // Search
+    search_active: bool,
+    search_query: String,
+    search_matches: Vec<(usize, usize)>,
+    search_match_set: HashSet<(usize, usize)>,
+    search_index: usize,
+    search_focus: FocusHandle,
 }
 
 impl RootView {
@@ -289,6 +304,12 @@ impl RootView {
             scroll_gesture: OngoingScroll::default(),
             h_max_offset: 0.0,
             viewport_w: 0.0,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_set: HashSet::new(),
+            search_index: 0,
+            search_focus: cx.focus_handle(),
         }
     }
 
@@ -542,6 +563,11 @@ impl RootView {
                 self.v_offset = 0.0;
                 self.h_offset = 0.0;
                 self.selected_cell = None;
+                self.search_active = false;
+                self.search_query.clear();
+                self.search_matches.clear();
+                self.search_match_set.clear();
+                self.search_index = 0;
                 self.show_toast(format!("Opened: {}", path.display()), window, cx);
             }
             Err(e) => {
@@ -591,6 +617,111 @@ impl RootView {
         if click_count >= 2 {
             self.copy_to_clipboard(row, col, window, cx);
         }
+        cx.notify();
+    }
+
+    // -- Search --
+
+    fn toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.state, AppState::Loaded { .. }) {
+            return;
+        }
+        if self.search_active {
+            self.search_active = false;
+            self.clear_search();
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.search_active = true;
+            self.search_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn dismiss_search(&mut self, _: &DismissSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_active {
+            return;
+        }
+        self.search_active = false;
+        self.clear_search();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn clear_search(&mut self) {
+        self.search_matches.clear();
+        self.search_match_set.clear();
+        self.search_index = 0;
+    }
+
+    fn execute_search(&mut self, cx: &mut Context<Self>) {
+        self.search_matches.clear();
+        self.search_match_set.clear();
+        self.search_index = 0;
+
+        let query = self.search_query.trim().to_lowercase();
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+
+        let AppState::Loaded { source, .. } = &self.state else {
+            return;
+        };
+
+        let rows = source.row_count();
+        let cols = source.col_count();
+
+        // Search headers
+        for col in 0..cols {
+            if source.column_name(col).to_lowercase().contains(&query) {
+                self.search_matches.push((Self::HEADER_ROW, col));
+            }
+        }
+
+        // Search data rows
+        for row in 0..rows {
+            for col in 0..cols {
+                let text = source.cell(row, col);
+                if text.to_lowercase().contains(&query) {
+                    self.search_matches.push((row, col));
+                }
+            }
+        }
+
+        self.search_match_set = self.search_matches.iter().copied().collect();
+
+        if !self.search_matches.is_empty() {
+            let (row, col) = self.search_matches[0];
+            self.selected_cell = Some((row, col));
+            self.reveal_selection();
+        }
+
+        cx.notify();
+    }
+
+    fn search_next(&mut self, _: &SearchNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_index = (self.search_index + 1) % self.search_matches.len();
+        let (row, col) = self.search_matches[self.search_index];
+        self.selected_cell = Some((row, col));
+        self.reveal_selection();
+        cx.notify();
+    }
+
+    fn search_prev(&mut self, _: &SearchPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        if self.search_index == 0 {
+            self.search_index = self.search_matches.len() - 1;
+        } else {
+            self.search_index -= 1;
+        }
+        let (row, col) = self.search_matches[self.search_index];
+        self.selected_cell = Some((row, col));
+        self.reveal_selection();
         cx.notify();
     }
 
@@ -773,6 +904,10 @@ impl Render for RootView {
                             .child(format!("{col_count} columns · {row_count} rows")),
                     );
 
+                // -- Search highlight state --
+                let current_match = self.search_matches.get(self.search_index).copied();
+                let search_match_set = &self.search_match_set;
+
                 // -- Column header row --
                 let header_bg = rgb(0x313244);
                 let header_selected_bg = rgb(0x585b70);
@@ -780,7 +915,17 @@ impl Render for RootView {
                 let mut header_data = div().flex().ml(px(spacer));
                 for (i, col) in (vis_first..vis_last).enumerate() {
                     let is_selected = self.selected_cell == Some((Self::HEADER_ROW, col));
-                    let bg = if is_selected { header_selected_bg } else { header_bg };
+                    let is_hdr_current = current_match == Some((Self::HEADER_ROW, col));
+                    let is_hdr_match = search_match_set.contains(&(Self::HEADER_ROW, col));
+                    let bg = if is_hdr_current {
+                        rgb(0xf9e2af)
+                    } else if is_hdr_match {
+                        rgb(0x7c6f3e)
+                    } else if is_selected {
+                        header_selected_bg
+                    } else {
+                        header_bg
+                    };
                     let view = view_entity.clone();
                     header_data = header_data.child(
                         div()
@@ -866,7 +1011,22 @@ impl Render for RootView {
                         // During drag: show data if cached (free), empty if not (skip I/O)
                         let show_data = !dragging_fast || source.is_cached(row_idx, col_idx);
                         let is_selected = self.selected_cell == Some((row_idx, col_idx));
-                        let cell_bg = if is_selected { rgb(0x45475a) } else { bg };
+                        let is_current_match = current_match == Some((row_idx, col_idx));
+                        let is_search_match = search_match_set.contains(&(row_idx, col_idx));
+                        let cell_bg = if is_current_match {
+                            rgb(0xf9e2af) // bright amber for current match
+                        } else if is_search_match {
+                            rgb(0x7c6f3e) // muted amber for other matches
+                        } else if is_selected {
+                            rgb(0x45475a)
+                        } else {
+                            bg
+                        };
+                        let cell_text_color = if is_current_match {
+                            rgb(0x1e1e2e) // dark text on bright background
+                        } else {
+                            rgb(0xcdd6f4)
+                        };
                         let mut cell = div()
                             // Scoped under the row's id, so no collisions however many columns.
                             .id(col_idx)
@@ -897,7 +1057,7 @@ impl Render for RootView {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(0xcdd6f4))
+                                        .text_color(cell_text_color)
                                         .whitespace_nowrap()
                                         .text_ellipsis()
                                         .child(source.cell(row_idx, col_idx)),
@@ -1119,6 +1279,10 @@ impl Render for RootView {
             .on_action(cx.listener(Self::last_row))
             .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::dismiss_search))
+            .on_action(cx.listener(Self::search_next))
+            .on_action(cx.listener(Self::search_prev))
             .size_full()
             .bg(rgb(0x1e1e2e))
             .child(content);
@@ -1152,6 +1316,196 @@ impl Render for RootView {
             );
         }
 
+        // Search bar overlay
+        if self.search_active {
+            let query_display = if self.search_query.is_empty() {
+                "Search…".to_string()
+            } else {
+                self.search_query.clone()
+            };
+            let query_is_empty = self.search_query.is_empty();
+            let has_matches = !self.search_matches.is_empty();
+            let counter_text = if has_matches {
+                format!("{} of {}", self.search_index + 1, self.search_matches.len())
+            } else if !self.search_query.is_empty() {
+                "0 results".to_string()
+            } else {
+                String::new()
+            };
+
+            let view_prev = cx.entity().downgrade();
+            let view_next = cx.entity().downgrade();
+            let view_key = cx.entity().downgrade();
+
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(8.0))
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("search-bar")
+                            .track_focus(&self.search_focus)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(rgb(0x313244))
+                            .border_1()
+                            .border_color(rgb(0x585b70))
+                            .shadow_md()
+                            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                                let keystroke = &event.keystroke;
+                                let key = keystroke.key.as_str();
+                                let is_cmd = keystroke.modifiers.platform || keystroke.modifiers.control;
+
+                                // Escape: dismiss search
+                                if key == "escape" {
+                                    view_key
+                                        .update_in(cx, |this, window, cx| {
+                                            this.dismiss_search(&DismissSearch, window, cx);
+                                        })
+                                        .ok();
+                                    return;
+                                }
+
+                                // Ctrl/Cmd+F: toggle off
+                                if key == "f" && is_cmd {
+                                    view_key
+                                        .update_in(cx, |this, window, cx| {
+                                            this.toggle_search(&ToggleSearch, window, cx);
+                                        })
+                                        .ok();
+                                    return;
+                                }
+
+                                // Enter: execute search
+                                if key == "enter" {
+                                    view_key
+                                        .update(cx, |this, cx| {
+                                            this.execute_search(cx);
+                                        })
+                                        .ok();
+                                    return;
+                                }
+
+                                // Backspace: delete last char
+                                if key == "backspace" {
+                                    view_key
+                                        .update(cx, |this, cx| {
+                                            this.search_query.pop();
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    return;
+                                }
+
+                                // Regular character input
+                                if let Some(ch) = &keystroke.key_char {
+                                    let text = ch.clone();
+                                    view_key
+                                        .update(cx, |this, cx| {
+                                            this.search_query.push_str(&text);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                } else if key.len() == 1 && !is_cmd && !keystroke.modifiers.alt {
+                                    let ch = key.to_string();
+                                    view_key
+                                        .update(cx, |this, cx| {
+                                            this.search_query.push_str(&ch);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0x1e1e2e))
+                                    .border_1()
+                                    .border_color(rgb(0x45475a))
+                                    .min_w(px(240.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .text_sm()
+                                            .text_color(if query_is_empty {
+                                                rgb(0x585b70)
+                                            } else {
+                                                rgb(0xcdd6f4)
+                                            })
+                                            .child(query_display)
+                                            .when(!query_is_empty, |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_color(rgb(0x89b4fa))
+                                                        .ml(px(-1.0))
+                                                        .child("|"),
+                                                )
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x6c7086))
+                                    .min_w(px(70.0))
+                                    .flex()
+                                    .justify_center()
+                                    .child(counter_text),
+                            )
+                            .child(
+                                div()
+                                    .id("search-prev-btn")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x45475a)))
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("▲")
+                                    .on_click(move |_, window, cx| {
+                                        view_prev
+                                            .update(cx, |this, cx| {
+                                                this.search_prev(&SearchPrev, window, cx);
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("search-next-btn")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x45475a)))
+                                    .text_sm()
+                                    .text_color(rgb(0xcdd6f4))
+                                    .child("▼")
+                                    .on_click(move |_, window, cx| {
+                                        view_next
+                                            .update(cx, |this, cx| {
+                                                this.search_next(&SearchNext, window, cx);
+                                            })
+                                            .ok();
+                                    }),
+                            ),
+                    ),
+            );
+        }
+
         // Toast notification overlay
         if let Some(msg) = &self.toast {
             root = root.child(
@@ -1182,7 +1536,8 @@ impl Render for RootView {
 mod tests {
     use super::{
         AppState, ColumnLayout, DataSource, DragTarget, HEADER_HEIGHT, Move, ROW_HEIGHT, RootView, SCROLLBAR_MIN_THUMB,
-        SCROLLBAR_SIZE, TABLE_MARGIN, key_bindings, next_cell, register_actions, reveal, thumb_geom,
+        SCROLLBAR_SIZE, SearchNext, SearchPrev, TABLE_MARGIN, key_bindings, next_cell, register_actions, reveal,
+        thumb_geom,
     };
     use gpui::{
         Entity, Focusable, Modifiers, MouseButton, MouseMoveEvent, Pixels, Point, ScrollDelta, ScrollEvent,
@@ -1761,5 +2116,119 @@ mod tests {
 
         cx.simulate_keystrokes("down ctrl-c");
         assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("2:1 full"));
+    }
+
+    // -- Search --
+
+    #[gpui::test]
+    fn search_finds_matching_cells(cx: &mut TestAppContext) {
+        // FakeSource: cell(r,c) = "{r}:{c}", column_name = "col"
+        let (view, cx) = open_view(cx, 10, &[150.0; 3]);
+        view.update(cx, |v, cx| {
+            v.search_active = true;
+            // Search for "0:1" — only cell (0,1) matches
+            v.search_query = "0:1".into();
+            v.execute_search(cx);
+        });
+        let (matches, idx, sel) = read(&view, cx, |v| {
+            (v.search_matches.clone(), v.search_index, v.selected_cell)
+        });
+        assert_eq!(matches, vec![(0, 1)]);
+        assert_eq!(idx, 0);
+        assert_eq!(sel, Some((0, 1)));
+    }
+
+    #[gpui::test]
+    fn search_is_case_insensitive(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10, &[150.0; 3]);
+        view.update(cx, |v, cx| {
+            v.search_active = true;
+            // "COL" should match headers (column_name returns "col")
+            v.search_query = "COL".into();
+            v.execute_search(cx);
+        });
+        let matches = read(&view, cx, |v| v.search_matches.clone());
+        // All 3 headers match
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().all(|&(r, _)| r == RootView::HEADER_ROW));
+    }
+
+    #[gpui::test]
+    fn search_empty_query_clears_matches(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10, &[150.0; 3]);
+        view.update(cx, |v, cx| {
+            v.search_active = true;
+            v.search_query = "0:0".into();
+            v.execute_search(cx);
+        });
+        assert!(!read(&view, cx, |v| v.search_matches.is_empty()));
+        // Now search with empty query
+        view.update(cx, |v, cx| {
+            v.search_query = "".into();
+            v.execute_search(cx);
+        });
+        assert!(read(&view, cx, |v| v.search_matches.is_empty()));
+    }
+
+    #[gpui::test]
+    fn search_no_matches(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10, &[150.0; 3]);
+        view.update(cx, |v, cx| {
+            v.search_active = true;
+            v.search_query = "zzzzz_no_match".into();
+            v.execute_search(cx);
+        });
+        assert!(read(&view, cx, |v| v.search_matches.is_empty()));
+    }
+
+    #[gpui::test]
+    fn search_navigation_wraps_around(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10, &[150.0; 3]);
+        view.update(cx, |v, cx| {
+            v.search_active = true;
+            // "5:" matches 3 cells: (5,0), (5,1), (5,2)
+            v.search_query = "5:".into();
+            v.execute_search(cx);
+        });
+        let n = read(&view, cx, |v| v.search_matches.len());
+        assert_eq!(n, 3);
+
+        // Navigate forward through all, then wrap
+        view.update_in(cx, |v, window, cx| v.search_next(&SearchNext, window, cx));
+        assert_eq!(read(&view, cx, |v| v.search_index), 1);
+        view.update_in(cx, |v, window, cx| v.search_next(&SearchNext, window, cx));
+        assert_eq!(read(&view, cx, |v| v.search_index), 2);
+        view.update_in(cx, |v, window, cx| v.search_next(&SearchNext, window, cx));
+        // Wrapped to 0
+        assert_eq!(read(&view, cx, |v| v.search_index), 0);
+
+        // Navigate backward, wrap
+        view.update_in(cx, |v, window, cx| v.search_prev(&SearchPrev, window, cx));
+        // Wrapped to last
+        assert_eq!(read(&view, cx, |v| v.search_index), 2);
+    }
+
+    #[gpui::test]
+    fn toggle_and_dismiss_search(cx: &mut TestAppContext) {
+        let (view, cx) = open_view(cx, 10, &[150.0; 3]);
+        assert!(!read(&view, cx, |v| v.search_active));
+
+        // Toggle on
+        cx.simulate_keystrokes(secondary!("f"));
+        assert!(read(&view, cx, |v| v.search_active));
+
+        // Execute a search, then dismiss
+        view.update(cx, |v, cx| {
+            v.search_query = "0:0".into();
+            v.execute_search(cx);
+        });
+        assert!(!read(&view, cx, |v| v.search_matches.is_empty()));
+        let sel = read(&view, cx, |v| v.selected_cell);
+
+        cx.simulate_keystrokes("escape");
+        assert!(!read(&view, cx, |v| v.search_active));
+        assert!(read(&view, cx, |v| v.search_matches.is_empty()));
+        // Selection persists on the last navigated match
+        assert_eq!(read(&view, cx, |v| v.selected_cell), sel);
     }
 }
