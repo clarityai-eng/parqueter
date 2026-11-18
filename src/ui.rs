@@ -1,11 +1,14 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{prelude::*, *};
 
 use crate::data::DataSource;
+use crate::search::{SearchRequest, parallel_search};
 
 const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
@@ -275,6 +278,8 @@ pub struct RootView {
     search_match_set: HashSet<(usize, usize)>,
     search_index: usize,
     search_focus: FocusHandle,
+    search_in_progress: bool,
+    search_cancel: Arc<AtomicBool>,
 }
 
 impl RootView {
@@ -310,6 +315,8 @@ impl RootView {
             search_match_set: HashSet::new(),
             search_index: 0,
             search_focus: cx.focus_handle(),
+            search_in_progress: false,
+            search_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -563,11 +570,14 @@ impl RootView {
                 self.v_offset = 0.0;
                 self.h_offset = 0.0;
                 self.selected_cell = None;
+                self.search_cancel.store(true, Ordering::Relaxed);
                 self.search_active = false;
+                self.search_in_progress = false;
                 self.search_query.clear();
                 self.search_matches.clear();
                 self.search_match_set.clear();
                 self.search_index = 0;
+                self.search_cancel = Arc::new(AtomicBool::new(false));
                 self.show_toast(format!("Opened: {}", path.display()), window, cx);
             }
             Err(e) => {
@@ -648,17 +658,22 @@ impl RootView {
     }
 
     fn clear_search(&mut self) {
+        self.search_cancel.store(true, Ordering::Relaxed);
+        self.search_in_progress = false;
         self.search_matches.clear();
         self.search_match_set.clear();
         self.search_index = 0;
     }
 
     fn execute_search(&mut self, cx: &mut Context<Self>) {
+        // Cancel any in-progress search.
+        self.search_cancel.store(true, Ordering::Relaxed);
         self.search_matches.clear();
         self.search_match_set.clear();
         self.search_index = 0;
+        self.search_in_progress = false;
 
-        let query = self.search_query.trim().to_lowercase();
+        let query = self.search_query.trim().to_string();
         if query.is_empty() {
             cx.notify();
             return;
@@ -668,17 +683,78 @@ impl RootView {
             return;
         };
 
+        let file_path = source.file_path().map(|p| p.to_path_buf());
+        let source = source.clone();
+        match file_path {
+            Some(ref path) => self.execute_parallel_search(path, &query, cx),
+            None => self.execute_sync_search(source, &query, cx),
+        }
+    }
+
+    /// Fast parallel search for file-backed sources.
+    fn execute_parallel_search(
+        &mut self,
+        path: &std::path::Path,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.search_cancel = cancel.clone();
+        self.search_in_progress = true;
+
+        let req = SearchRequest {
+            path: path.into(),
+            needle: query.to_string(),
+            cancelled: cancel,
+        };
+
+        cx.spawn(async move |this, cx| {
+            let results = cx.background_executor().spawn(async move {
+                parallel_search(&req)
+            }).await;
+
+            this.update(cx, |view, cx| {
+                view.search_in_progress = false;
+
+                match results {
+                    Ok(matches) => {
+                        view.search_match_set = matches.iter().copied().collect();
+                        view.search_matches = matches;
+
+                        if !view.search_matches.is_empty() {
+                            let (row, col) = view.search_matches[0];
+                            view.selected_cell = Some((row, col));
+                            view.reveal_selection();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("parqueter: search failed: {e}");
+                    }
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+
+        cx.notify();
+    }
+
+    /// Synchronous fallback for non-file-backed sources (e.g. tests).
+    fn execute_sync_search(
+        &mut self,
+        source: Rc<dyn DataSource>,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let query = query.to_lowercase();
         let rows = source.row_count();
         let cols = source.col_count();
 
-        // Search headers
         for col in 0..cols {
             if source.column_name(col).to_lowercase().contains(&query) {
                 self.search_matches.push((Self::HEADER_ROW, col));
             }
         }
 
-        // Search data rows
         for row in 0..rows {
             for col in 0..cols {
                 let text = source.cell(row, col);
@@ -1325,7 +1401,9 @@ impl Render for RootView {
             };
             let query_is_empty = self.search_query.is_empty();
             let has_matches = !self.search_matches.is_empty();
-            let counter_text = if has_matches {
+            let counter_text = if self.search_in_progress {
+                "Searching…".to_string()
+            } else if has_matches {
                 format!("{} of {}", self.search_index + 1, self.search_matches.len())
             } else if !self.search_query.is_empty() {
                 "0 results".to_string()
@@ -1362,7 +1440,6 @@ impl Render for RootView {
                                 let keystroke = &event.keystroke;
                                 let key = keystroke.key.as_str();
                                 let is_cmd = keystroke.modifiers.platform || keystroke.modifiers.control;
-
                                 // Escape: dismiss search
                                 if key == "escape" {
                                     view_key
@@ -2124,7 +2201,7 @@ mod tests {
     fn search_finds_matching_cells(cx: &mut TestAppContext) {
         // FakeSource: cell(r,c) = "{r}:{c}", column_name = "col"
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_active = true;
             // Search for "0:1" — only cell (0,1) matches
             v.search_query = "0:1".into();
@@ -2141,7 +2218,7 @@ mod tests {
     #[gpui::test]
     fn search_is_case_insensitive(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_active = true;
             // "COL" should match headers (column_name returns "col")
             v.search_query = "COL".into();
@@ -2156,14 +2233,14 @@ mod tests {
     #[gpui::test]
     fn search_empty_query_clears_matches(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_active = true;
             v.search_query = "0:0".into();
             v.execute_search(cx);
         });
         assert!(!read(&view, cx, |v| v.search_matches.is_empty()));
         // Now search with empty query
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_query = "".into();
             v.execute_search(cx);
         });
@@ -2173,7 +2250,7 @@ mod tests {
     #[gpui::test]
     fn search_no_matches(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_active = true;
             v.search_query = "zzzzz_no_match".into();
             v.execute_search(cx);
@@ -2184,7 +2261,7 @@ mod tests {
     #[gpui::test]
     fn search_navigation_wraps_around(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_active = true;
             // "5:" matches 3 cells: (5,0), (5,1), (5,2)
             v.search_query = "5:".into();
@@ -2218,7 +2295,7 @@ mod tests {
         assert!(read(&view, cx, |v| v.search_active));
 
         // Execute a search, then dismiss
-        view.update(cx, |v, cx| {
+        view.update_in(cx, |v, window, cx| {
             v.search_query = "0:0".into();
             v.execute_search(cx);
         });

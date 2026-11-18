@@ -1,4 +1,5 @@
 mod data;
+mod search;
 mod ui;
 
 use std::path::{Path, PathBuf};

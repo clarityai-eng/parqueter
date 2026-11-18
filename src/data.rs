@@ -47,6 +47,10 @@ pub trait DataSource {
     fn column_widths(&self) -> Vec<f32>;
     /// Check if the cell's data is cached without triggering a load.
     fn is_cached(&self, row: usize, col: usize) -> bool;
+    /// File path for the underlying data, if backed by a file.
+    fn file_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 // -- LazyParquetSource --
@@ -285,6 +289,10 @@ impl DataSource for LazyParquetSource {
     fn is_cached(&self, row: usize, col: usize) -> bool {
         self.locate(row)
             .is_some_and(|(chunk, _)| self.cache.borrow().contains(&(chunk, col)))
+    }
+
+    fn file_path(&self) -> Option<&std::path::Path> {
+        Some(&self.path)
     }
 }
 
