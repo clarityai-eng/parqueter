@@ -2,6 +2,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use futures::channel::mpsc::UnboundedSender;
+
 use aho_corasick::AhoCorasick;
 use arrow::array::{Array, AsArray, DictionaryArray, StringArray};
 use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type};
@@ -27,10 +29,12 @@ const HEADER_ROW: usize = usize::MAX;
 /// Batch size for reading row groups.
 const BATCH_SIZE: usize = 64 * 1024;
 
-/// Run parallel text search over a parquet file.
+/// Run parallel text search over a parquet file (batch mode).
 ///
 /// Returns matches as `(global_row, column_index)` sorted by (row, col).
 /// Column indices refer to the full schema, not the projected subset.
+/// Used by tests; the UI uses `streaming_search` instead.
+#[cfg(test)]
 pub fn parallel_search(req: &SearchRequest) -> Result<SearchResult, String> {
     if req.needle.is_empty() {
         return Ok(Vec::new());
@@ -119,6 +123,130 @@ pub fn parallel_search(req: &SearchRequest) -> Result<SearchResult, String> {
     Ok(results)
 }
 
+/// Streaming variant of `parallel_search`: sends results per row group through
+/// a channel instead of collecting them all. When this function returns, `tx`
+/// drops and the channel closes.
+pub fn streaming_search(req: &SearchRequest, tx: UnboundedSender<Vec<(usize, usize)>>) -> Result<(), String> {
+    if req.needle.is_empty() {
+        return Ok(());
+    }
+
+    let data = Bytes::from(std::fs::read(&req.path).map_err(|e| e.to_string())?);
+    let meta = ArrowReaderMetadata::load(&data, ArrowReaderOptions::new())
+        .map_err(|e| e.to_string())?;
+    let schema = meta.schema().clone();
+
+    let searchable: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| is_searchable(f.data_type()))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Send header matches first.
+    let header_hits = search_headers(&schema, &req.needle);
+    if !header_hits.is_empty() {
+        tx.unbounded_send(header_hits).ok();
+    }
+
+    if searchable.is_empty() {
+        return Ok(());
+    }
+
+    let mask = ProjectionMask::roots(meta.parquet_schema(), searchable.clone());
+
+    let searcher = AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build([&req.needle])
+        .map_err(|e| e.to_string())?;
+    let searcher = Arc::new(searcher);
+
+    let n_rg = meta.metadata().num_row_groups();
+
+    let mut rg_bases = Vec::with_capacity(n_rg);
+    let mut base = 0usize;
+    for rg in 0..n_rg {
+        rg_bases.push(base);
+        base += meta.metadata().row_group(rg).num_rows() as usize;
+    }
+
+    if n_rg <= 1 {
+        // Single row group: read batches sequentially, match in parallel,
+        // send each batch's results through the channel.
+        streaming_single_row_group(
+            &data, &meta, &mask, &searchable, &searcher, &req.cancelled, &tx,
+            rg_bases.first().copied().unwrap_or(0),
+        )?;
+    } else {
+        // Multi row group: one rayon task per row group, each sends through tx.
+        (0..n_rg).into_par_iter().for_each(|rg| {
+            if req.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Ok(hits) = search_row_group(
+                &data, &meta, &mask, &searchable, &searcher, rg, rg_bases[rg],
+            ) {
+                if !hits.is_empty() {
+                    tx.unbounded_send(hits).ok();
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Single-row-group streaming: decode batches sequentially, match in parallel,
+/// send per-batch results through the channel.
+fn streaming_single_row_group(
+    data: &Bytes,
+    meta: &ArrowReaderMetadata,
+    mask: &ProjectionMask,
+    searchable: &[usize],
+    searcher: &AhoCorasick,
+    cancelled: &AtomicBool,
+    tx: &UnboundedSender<Vec<(usize, usize)>>,
+    base_row: usize,
+) -> Result<(), String> {
+    if meta.metadata().num_row_groups() == 0 {
+        return Ok(());
+    }
+
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(data.clone(), meta.clone())
+        .with_row_groups(vec![0])
+        .with_projection(mask.clone())
+        .with_batch_size(BATCH_SIZE)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut batches = Vec::new();
+    let mut offset = base_row;
+    for batch in reader {
+        let batch = batch.map_err(|e| e.to_string())?;
+        let n = batch.num_rows();
+        batches.push((offset, batch));
+        offset += n;
+    }
+
+    let tx = tx.clone();
+    batches.into_par_iter().for_each(|(row_offset, batch)| {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut hits = Vec::new();
+        for (proj_idx, col) in batch.columns().iter().enumerate() {
+            let full_col_idx = searchable[proj_idx];
+            search_column(col, searcher, row_offset, full_col_idx, &mut hits);
+        }
+        if !hits.is_empty() {
+            tx.unbounded_send(hits).ok();
+        }
+    });
+
+    Ok(())
+}
+
 /// Check if a data type should be included in search.
 fn is_searchable(dt: &DataType) -> bool {
     matches!(
@@ -177,6 +305,7 @@ fn search_row_group(
 
 /// Fallback for single-row-group files: read batches sequentially,
 /// then distribute SIMD matching across rayon tasks.
+#[cfg(test)]
 fn search_single_row_group(
     data: &Bytes,
     meta: &ArrowReaderMetadata,
@@ -716,6 +845,30 @@ mod tests {
     }
 
     /// Manual probe against a real file:
+    #[test]
+    fn streaming_search_matches_parallel() {
+        use futures::StreamExt;
+
+        let batch = test_batch(5000);
+        let file = write_test_parquet("streaming", &batch, 500);
+
+        let req_p = make_request(&file.0, "name_42");
+        let parallel_results = parallel_search(&req_p).unwrap();
+
+        let req_s = make_request(&file.0, "name_42");
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        streaming_search(&req_s, tx).unwrap();
+
+        let streaming_results: Vec<(usize, usize)> = futures::executor::block_on(async {
+            let batches: Vec<Vec<(usize, usize)>> = rx.collect().await;
+            let mut all: Vec<_> = batches.into_iter().flatten().collect();
+            all.sort_unstable();
+            all
+        });
+
+        assert_eq!(parallel_results, streaming_results);
+    }
+
     /// PARQUETER_SEARCH_FILE=/path/file.parquet cargo test --release search::tests::probe_real -- --ignored --nocapture
     #[test]
     #[ignore]

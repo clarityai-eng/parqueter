@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -7,8 +6,11 @@ use std::time::Duration;
 
 use gpui::{prelude::*, *};
 
+use futures::StreamExt;
+use futures::channel::mpsc;
+
 use crate::data::DataSource;
-use crate::search::{SearchRequest, parallel_search};
+use crate::search::{SearchRequest, streaming_search};
 
 const ROW_NUM_WIDTH: f32 = 60.0;
 const ROW_HEIGHT: f32 = 28.0;
@@ -275,11 +277,11 @@ pub struct RootView {
     search_active: bool,
     search_query: String,
     search_matches: Vec<(usize, usize)>,
-    search_match_set: HashSet<(usize, usize)>,
     search_index: usize,
     search_focus: FocusHandle,
     search_in_progress: bool,
     search_cancel: Arc<AtomicBool>,
+    search_generation: u64,
 }
 
 impl RootView {
@@ -312,11 +314,11 @@ impl RootView {
             search_active: false,
             search_query: String::new(),
             search_matches: Vec::new(),
-            search_match_set: HashSet::new(),
             search_index: 0,
             search_focus: cx.focus_handle(),
             search_in_progress: false,
             search_cancel: Arc::new(AtomicBool::new(false)),
+            search_generation: 0,
         }
     }
 
@@ -575,8 +577,8 @@ impl RootView {
                 self.search_in_progress = false;
                 self.search_query.clear();
                 self.search_matches.clear();
-                self.search_match_set.clear();
                 self.search_index = 0;
+                self.search_generation = self.search_generation.wrapping_add(1);
                 self.search_cancel = Arc::new(AtomicBool::new(false));
                 self.show_toast(format!("Opened: {}", path.display()), window, cx);
             }
@@ -661,15 +663,14 @@ impl RootView {
         self.search_cancel.store(true, Ordering::Relaxed);
         self.search_in_progress = false;
         self.search_matches.clear();
-        self.search_match_set.clear();
         self.search_index = 0;
+        self.search_generation = self.search_generation.wrapping_add(1);
     }
 
     fn execute_search(&mut self, cx: &mut Context<Self>) {
         // Cancel any in-progress search.
         self.search_cancel.store(true, Ordering::Relaxed);
         self.search_matches.clear();
-        self.search_match_set.clear();
         self.search_index = 0;
         self.search_in_progress = false;
 
@@ -692,6 +693,7 @@ impl RootView {
     }
 
     /// Fast parallel search for file-backed sources.
+    /// Results stream in progressively as row groups complete.
     fn execute_parallel_search(
         &mut self,
         path: &std::path::Path,
@@ -701,6 +703,8 @@ impl RootView {
         let cancel = Arc::new(AtomicBool::new(false));
         self.search_cancel = cancel.clone();
         self.search_in_progress = true;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
 
         let req = SearchRequest {
             path: path.into(),
@@ -708,28 +712,58 @@ impl RootView {
             cancelled: cancel,
         };
 
+        let (tx, rx) = mpsc::unbounded::<Vec<(usize, usize)>>();
+
+        // Producer: rayon work on background thread. When streaming_search
+        // returns, tx drops and the channel closes.
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = streaming_search(&req, tx) {
+                    eprintln!("parqueter: search failed: {e}");
+                }
+            })
+            .detach();
+
+        // Consumer: drain channel in chunks, yielding to the event loop between
+        // updates so the UI stays responsive and repaints with each wave of results.
         cx.spawn(async move |this, cx| {
-            let results = cx.background_executor().spawn(async move {
-                parallel_search(&req)
-            }).await;
+            let mut is_first = true;
+            let mut chunked = rx.ready_chunks(256);
 
+            while let Some(batches) = chunked.next().await {
+                this.update(cx, |view, cx| {
+                    if view.search_generation != generation {
+                        return;
+                    }
+                    for batch in batches {
+                        view.search_matches.extend(batch);
+                    }
+
+                    if is_first && !view.search_matches.is_empty() {
+                        let (row, col) = view.search_matches[0];
+                        view.selected_cell = Some((row, col));
+                        view.reveal_selection();
+                    }
+                    cx.notify();
+                }).ok();
+                is_first = false;
+
+                // Yield to the event loop so the UI can repaint between waves.
+                cx.background_executor().timer(Duration::from_millis(1)).await;
+            }
+
+            // Channel closed: search complete. Final sort for navigation order.
             this.update(cx, |view, cx| {
+                if view.search_generation != generation {
+                    return;
+                }
                 view.search_in_progress = false;
-
-                match results {
-                    Ok(matches) => {
-                        view.search_match_set = matches.iter().copied().collect();
-                        view.search_matches = matches;
-
-                        if !view.search_matches.is_empty() {
-                            let (row, col) = view.search_matches[0];
-                            view.selected_cell = Some((row, col));
-                            view.reveal_selection();
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("parqueter: search failed: {e}");
-                    }
+                view.search_matches.sort_unstable();
+                view.search_index = 0;
+                if !view.search_matches.is_empty() {
+                    let (row, col) = view.search_matches[0];
+                    view.selected_cell = Some((row, col));
+                    view.reveal_selection();
                 }
                 cx.notify();
             }).ok();
@@ -764,8 +798,6 @@ impl RootView {
             }
         }
 
-        self.search_match_set = self.search_matches.iter().copied().collect();
-
         if !self.search_matches.is_empty() {
             let (row, col) = self.search_matches[0];
             self.selected_cell = Some((row, col));
@@ -773,6 +805,13 @@ impl RootView {
         }
 
         cx.notify();
+    }
+
+    /// O(log n) check whether a cell is in the search results.
+    /// Only returns true once the search is complete (results sorted).
+    fn is_search_match(&self, row: usize, col: usize) -> bool {
+        !self.search_in_progress
+            && self.search_matches.binary_search(&(row, col)).is_ok()
     }
 
     fn search_next(&mut self, _: &SearchNext, _window: &mut Window, cx: &mut Context<Self>) {
@@ -982,7 +1021,6 @@ impl Render for RootView {
 
                 // -- Search highlight state --
                 let current_match = self.search_matches.get(self.search_index).copied();
-                let search_match_set = &self.search_match_set;
 
                 // -- Column header row --
                 let header_bg = rgb(0x313244);
@@ -992,7 +1030,7 @@ impl Render for RootView {
                 for (i, col) in (vis_first..vis_last).enumerate() {
                     let is_selected = self.selected_cell == Some((Self::HEADER_ROW, col));
                     let is_hdr_current = current_match == Some((Self::HEADER_ROW, col));
-                    let is_hdr_match = search_match_set.contains(&(Self::HEADER_ROW, col));
+                    let is_hdr_match = self.is_search_match(Self::HEADER_ROW, col);
                     let bg = if is_hdr_current {
                         rgb(0xf9e2af)
                     } else if is_hdr_match {
@@ -1088,7 +1126,7 @@ impl Render for RootView {
                         let show_data = !dragging_fast || source.is_cached(row_idx, col_idx);
                         let is_selected = self.selected_cell == Some((row_idx, col_idx));
                         let is_current_match = current_match == Some((row_idx, col_idx));
-                        let is_search_match = search_match_set.contains(&(row_idx, col_idx));
+                        let is_search_match = self.is_search_match(row_idx, col_idx);
                         let cell_bg = if is_current_match {
                             rgb(0xf9e2af) // bright amber for current match
                         } else if is_search_match {
@@ -1401,7 +1439,9 @@ impl Render for RootView {
             };
             let query_is_empty = self.search_query.is_empty();
             let has_matches = !self.search_matches.is_empty();
-            let counter_text = if self.search_in_progress {
+            let counter_text = if self.search_in_progress && has_matches {
+                format!("{} matches found…", self.search_matches.len())
+            } else if self.search_in_progress {
                 "Searching…".to_string()
             } else if has_matches {
                 format!("{} of {}", self.search_index + 1, self.search_matches.len())
@@ -1476,6 +1516,21 @@ impl Render for RootView {
                                         .update(cx, |this, cx| {
                                             this.search_query.pop();
                                             cx.notify();
+                                        })
+                                        .ok();
+                                    return;
+                                }
+
+                                // Paste from clipboard
+                                if key == "v" && is_cmd {
+                                    view_key
+                                        .update(cx, |this, cx| {
+                                            if let Some(item) = cx.read_from_clipboard() {
+                                                if let Some(text) = item.text() {
+                                                    this.search_query.push_str(&text);
+                                                    cx.notify();
+                                                }
+                                            }
                                         })
                                         .ok();
                                     return;
@@ -2201,7 +2256,7 @@ mod tests {
     fn search_finds_matching_cells(cx: &mut TestAppContext) {
         // FakeSource: cell(r,c) = "{r}:{c}", column_name = "col"
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_active = true;
             // Search for "0:1" — only cell (0,1) matches
             v.search_query = "0:1".into();
@@ -2218,7 +2273,7 @@ mod tests {
     #[gpui::test]
     fn search_is_case_insensitive(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_active = true;
             // "COL" should match headers (column_name returns "col")
             v.search_query = "COL".into();
@@ -2233,14 +2288,14 @@ mod tests {
     #[gpui::test]
     fn search_empty_query_clears_matches(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_active = true;
             v.search_query = "0:0".into();
             v.execute_search(cx);
         });
         assert!(!read(&view, cx, |v| v.search_matches.is_empty()));
         // Now search with empty query
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_query = "".into();
             v.execute_search(cx);
         });
@@ -2250,7 +2305,7 @@ mod tests {
     #[gpui::test]
     fn search_no_matches(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_active = true;
             v.search_query = "zzzzz_no_match".into();
             v.execute_search(cx);
@@ -2261,7 +2316,7 @@ mod tests {
     #[gpui::test]
     fn search_navigation_wraps_around(cx: &mut TestAppContext) {
         let (view, cx) = open_view(cx, 10, &[150.0; 3]);
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_active = true;
             // "5:" matches 3 cells: (5,0), (5,1), (5,2)
             v.search_query = "5:".into();
@@ -2295,7 +2350,7 @@ mod tests {
         assert!(read(&view, cx, |v| v.search_active));
 
         // Execute a search, then dismiss
-        view.update_in(cx, |v, window, cx| {
+        view.update(cx, |v, cx| {
             v.search_query = "0:0".into();
             v.execute_search(cx);
         });
