@@ -282,6 +282,9 @@ pub struct RootView {
     search_in_progress: bool,
     search_cancel: Arc<AtomicBool>,
     search_generation: u64,
+    search_executed: bool,
+    cursor_visible: bool,
+    cursor_blink_generation: usize,
 }
 
 impl RootView {
@@ -319,6 +322,9 @@ impl RootView {
             search_in_progress: false,
             search_cancel: Arc::new(AtomicBool::new(false)),
             search_generation: 0,
+            search_executed: false,
+            cursor_visible: true,
+            cursor_blink_generation: 0,
         }
     }
 
@@ -641,10 +647,12 @@ impl RootView {
         if self.search_active {
             self.search_active = false;
             self.clear_search();
+            self.stop_cursor_blink();
             self.focus_handle.focus(window, cx);
         } else {
             self.search_active = true;
             self.search_focus.focus(window, cx);
+            self.start_cursor_blink(window, cx);
         }
         cx.notify();
     }
@@ -655,8 +663,41 @@ impl RootView {
         }
         self.search_active = false;
         self.clear_search();
+        self.stop_cursor_blink();
         self.focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    fn start_cursor_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_visible = true;
+        self.cursor_blink_generation = self.cursor_blink_generation.wrapping_add(1);
+        let generation = self.cursor_blink_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let should_continue = this
+                    .update(cx, |view, cx| {
+                        if view.cursor_blink_generation != generation || !view.search_active {
+                            return false;
+                        }
+                        view.cursor_visible = !view.cursor_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn stop_cursor_blink(&mut self) {
+        self.cursor_blink_generation = self.cursor_blink_generation.wrapping_add(1);
+        self.cursor_visible = true;
     }
 
     fn clear_search(&mut self) {
@@ -665,6 +706,7 @@ impl RootView {
         self.search_matches.clear();
         self.search_index = 0;
         self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_executed = false;
     }
 
     fn execute_search(&mut self, cx: &mut Context<Self>) {
@@ -679,6 +721,7 @@ impl RootView {
             cx.notify();
             return;
         }
+        self.search_executed = true;
 
         let AppState::Loaded { source, .. } = &self.state else {
             return;
@@ -1438,14 +1481,17 @@ impl Render for RootView {
                 self.search_query.clone()
             };
             let query_is_empty = self.search_query.is_empty();
+            let cursor_visible = self.cursor_visible;
             let has_matches = !self.search_matches.is_empty();
+            let search_executed = self.search_executed;
+            let show_search_button = !query_is_empty && !search_executed && !self.search_in_progress;
             let counter_text = if self.search_in_progress && has_matches {
                 format!("{} matches found…", self.search_matches.len())
             } else if self.search_in_progress {
                 "Searching…".to_string()
             } else if has_matches {
                 format!("{} of {}", self.search_index + 1, self.search_matches.len())
-            } else if !self.search_query.is_empty() {
+            } else if search_executed {
                 "0 results".to_string()
             } else {
                 String::new()
@@ -1454,6 +1500,7 @@ impl Render for RootView {
             let view_prev = cx.entity().downgrade();
             let view_next = cx.entity().downgrade();
             let view_key = cx.entity().downgrade();
+            let view_search_btn = cx.entity().downgrade();
 
             root = root.child(
                 div()
@@ -1515,6 +1562,8 @@ impl Render for RootView {
                                     view_key
                                         .update(cx, |this, cx| {
                                             this.search_query.pop();
+                                            this.search_executed = false;
+                                            this.cursor_visible = true;
                                             cx.notify();
                                         })
                                         .ok();
@@ -1528,6 +1577,8 @@ impl Render for RootView {
                                             if let Some(item) = cx.read_from_clipboard() {
                                                 if let Some(text) = item.text() {
                                                     this.search_query.push_str(&text);
+                                                    this.search_executed = false;
+                                                    this.cursor_visible = true;
                                                     cx.notify();
                                                 }
                                             }
@@ -1542,6 +1593,8 @@ impl Render for RootView {
                                     view_key
                                         .update(cx, |this, cx| {
                                             this.search_query.push_str(&text);
+                                            this.search_executed = false;
+                                            this.cursor_visible = true;
                                             cx.notify();
                                         })
                                         .ok();
@@ -1550,6 +1603,8 @@ impl Render for RootView {
                                     view_key
                                         .update(cx, |this, cx| {
                                             this.search_query.push_str(&ch);
+                                            this.search_executed = false;
+                                            this.cursor_visible = true;
                                             cx.notify();
                                         })
                                         .ok();
@@ -1577,25 +1632,47 @@ impl Render for RootView {
                                                 rgb(0xcdd6f4)
                                             })
                                             .child(query_display)
-                                            .when(!query_is_empty, |el| {
-                                                el.child(
-                                                    div()
-                                                        .text_color(rgb(0x89b4fa))
-                                                        .ml(px(-1.0))
-                                                        .child("|"),
-                                                )
-                                            }),
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(0x89b4fa))
+                                                    .ml(px(-1.0))
+                                                    .child(if cursor_visible { "|" } else { " " }),
+                                            ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x6c7086))
-                                    .min_w(px(70.0))
-                                    .flex()
-                                    .justify_center()
-                                    .child(counter_text),
-                            )
+                            .when(show_search_button, |el| {
+                                el.child(
+                                    div()
+                                        .id("search-exec-btn")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x89b4fa))
+                                        .hover(|s| s.bg(rgb(0x74c7ec)))
+                                        .text_sm()
+                                        .text_color(rgb(0x1e1e2e))
+                                        .child("Search")
+                                        .on_click(move |_, _window, cx| {
+                                            view_search_btn
+                                                .update(cx, |this, cx| {
+                                                    this.execute_search(cx);
+                                                })
+                                                .ok();
+                                        }),
+                                )
+                            })
+                            .when(!show_search_button, |el| {
+                                el.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0x6c7086))
+                                        .min_w(px(70.0))
+                                        .flex()
+                                        .justify_center()
+                                        .child(counter_text),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("search-prev-btn")
